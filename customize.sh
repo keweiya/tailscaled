@@ -63,6 +63,8 @@ rm -rf "$MODPATH/files" "$MODPATH/tailscale"
 ui_print "- Setting permissions"
 set_perm_recursive "$INSTALL_DIR" 0 0 0755 0755
 set_perm_recursive "$MODPATH/system/bin" 0 0 0755 0755
+# KernelSU / APatch read the WebUI from the module directory itself.
+[ -d "$MODPATH/webroot" ] && set_perm_recursive "$MODPATH/webroot" 0 0 0755 0644
 set_perm "$MODPATH/service.sh" 0 0 0755
 mv -f "$MODPATH/service.sh" "$SERVICE_DIR/tailscaled_service.sh"
 

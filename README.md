@@ -113,6 +113,22 @@ survive module updates. Deleting them restores the defaults.
 > the *kernel* send those destinations into the tunnel. Both are needed for a
 > subnet to work.
 
+## WebUI
+
+The module ships a KernelSU / APatch WebUI (open it from the module card in the
+manager). Four tabs:
+
+| Tab | What it does |
+|---|---|
+| **Status** | live state dot, tailnet address, `BackendState`, routed prefixes, whether the binary still matches the known-good copy, and the three proxy-exemption verdicts. Start / Stop / Restart, plus **Login**, which fetches a `login.tailscale.com` link and shows it as a tappable URL. |
+| **Routes** | edit `/data/adb/tailscale/routes` in place and press *Save & apply* — the service drops the old rules and installs the new ones immediately, no restart needed. |
+| **Log** | the daemon log, with an auto-refresh toggle and a clear button. |
+| **Diagnostics** | the same dump as `tailscaled.service diag`. |
+
+The WebUI only calls the service script, so anything it does you can also do over
+`adb shell` / a terminal with the commands below. If the status dot is red and
+reads *unavailable*, the manager's root bridge is not answering — use the CLI.
+
 ## Commands
 
 ```sh
@@ -227,6 +243,7 @@ META-INF/                 installer
 customize.sh              installs to /data/adb/tailscale, stores the binary guard
 service.sh                boot entry (waits for boot, then runs start.sh)
 system/bin/               tailscale / tailscaled / tailscaled.service wrappers
+webroot/                  KernelSU / APatch WebUI (index.html, app.js, ksu.js, style.css)
 tailscale/settings.ini    all paths, prefixes, table ids  -> /data/adb/tailscale/
 tailscale/routes          prefixes routed into the TUN     -> /data/adb/tailscale/
 tailscale/scripts/        start.sh, tailscaled.service, tailscaled.inotify

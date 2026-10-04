@@ -328,6 +328,78 @@ log_view() {
   esac
 }
 
+# --------------------------------------------------------- WebUI helpers ---
+# Verdict for one chain: is rule 1 a RETURN for tunnel traffic?
+_exempt_state() {
+  _t=$1
+  _c=$2
+  iptables -t "$_t" -L "$_c" -n >/dev/null 2>&1 || { echo "--"; return; }
+  _r=$(iptables -t "$_t" -L "$_c" -n -v --line-numbers 2>/dev/null | awk '$1 == 1 { print; exit }')
+  if echo "${_r}" | grep -q "${tun_iface}"; then echo "OK"; else echo "BAD"; fi
+}
+
+# Machine-readable status for the WebUI: plain key=value lines.
+show_webstatus() {
+  _pid=$(daemon_pid)
+  if [ -n "${_pid}" ]; then echo "daemon=1"; echo "pid=${_pid}"; else echo "daemon=0"; echo "pid="; fi
+
+  _wp=$(cat "${tailscaled_run_dir}/watchdog.pid" 2>/dev/null)
+  if [ -n "${_wp}" ] && kill -0 "${_wp}" 2>/dev/null; then
+    echo "watchdog=1"; echo "watchdog_pid=${_wp}"
+  else
+    echo "watchdog=0"; echo "watchdog_pid="
+  fi
+
+  echo "iface=${tun_iface}"
+  _ip=$(ip -o -4 addr show "${tun_iface}" 2>/dev/null | awk '{print $4}' | head -n1)
+  [ -n "${_ip}" ] || _ip=$("${tailscale_bin}" ${tailscale_bin_param} ip -4 2>/dev/null | head -n1)
+  echo "ip4=${_ip}"
+  echo "routes=$(route_prefixes | tr '\n' ' ')"
+  echo "version=$(awk -F'=' '/^version=/ { print $2 }' "${module_prop}" 2>/dev/null)"
+
+  _want=$(cat "${tailscaled_bin_sum}" 2>/dev/null)
+  _have=$(hash_file "${tailscaled_bin}")
+  if [ -z "${_want}" ] || [ "${_have}" = "${_want}" ]; then
+    echo "binary_ok=1"
+  else
+    echo "binary_ok=0"
+  fi
+
+  echo "exempt_prerouting=$(_exempt_state mangle PREROUTING)"
+  echo "exempt_output=$(_exempt_state mangle OUTPUT)"
+  echo "exempt_nat=$(_exempt_state nat OUTPUT)"
+
+  _backend=""
+  _user=""
+  _health=""
+  if [ -n "${_pid}" ] && [ -S "${tailscale_dir}/run/tailscaled.sock" ]; then
+    _json=$("${tailscale_bin}" ${tailscale_bin_param} status --json 2>/dev/null)
+    _backend=$(printf '%s' "${_json}" | grep -o '"BackendState": *"[^"]*"' | head -n1 | sed 's/.*"\([^"]*\)"$/\1/')
+    _user=$(printf '%s' "${_json}" | grep -o '"LoginName": *"[^"]*"' | head -n1 | sed 's/.*"\([^"]*\)"$/\1/')
+    _health=$("${tailscale_bin}" ${tailscale_bin_param} status 2>&1 | grep '^#' | sed 's/^#[[:space:]]*//' | head -n 3 | tr '\n' ';')
+  fi
+  echo "backend=${_backend}"
+  echo "user=${_user}"
+  echo "health=${_health}"
+}
+
+# Re-read the routes file: drop everything we installed, then install it again.
+routes_reload() {
+  _guard=0
+  while [ "${_guard}" -lt 100 ]; do
+    _p=$(ip rule show 2>/dev/null | grep "lookup ${tun_table}\$" | head -n1 | awk -F: '{print $1}')
+    [ -n "${_p}" ] || break
+    ip rule del pref "${_p}" 2>/dev/null || break
+    _guard=$((_guard + 1))
+  done
+  ip route show 2>/dev/null | grep "dev ${tun_iface} metric 1" | while read -r _r; do
+    ip route del ${_r} 2>/dev/null
+  done
+  ip route flush table "${tun_table}" 2>/dev/null
+  diag "routes-reload: cleared old rules, re-reading ${tailscale_routes_file}"
+  add_routes
+}
+
 # ------------------------------------------------------------------ dispatch --
 case "$1" in
   start)      start_tailscaled ;;
@@ -336,9 +408,11 @@ case "$1" in
   status)     show_status ;;
   routes)     show_routes ;;
   diag)       show_diag ;;
+  webstatus)  show_webstatus ;;
+  routes-reload) routes_reload ;;
   log)        log_view "$2" ;;
   __watchdog) route_watchdog ;;
   *)
-    echo "usage: ${scripts_name} {start|stop|restart|status|routes|diag|log{runs|service|tailscaled|diag}}"
+    echo "usage: ${scripts_name} {start|stop|restart|status|routes|routes-reload|diag|webstatus|log{runs|service|tailscaled|diag}}"
     ;;
 esac

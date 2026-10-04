@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Tailscale</title>
+<link rel="stylesheet" href="./style.css">
+</head>
+<body>
+
+<header>
+  <div class="brand">
+    <span id="dot" class="dot"></span>
+    <div>
+      <div id="status-main" class="status-main">loading…</div>
+      <div id="status-sub" class="status-sub">querying tailscaled</div>
+    </div>
+  </div>
+  <button id="refresh" class="ghost" title="refresh">⟳</button>
+</header>
+
+<nav class="tabs">
+  <button id="tab-status" class="tab">Status</button>
+  <button id="tab-routes" class="tab">Routes</button>
+  <button id="tab-log"    class="tab">Log</button>
+  <button id="tab-diag"   class="tab">Diagnostics</button>
+</nav>
+
+<main>
+
+  <!-- ---------------------------------------------------------- status -->
+  <section id="panel-status">
+    <div id="health" class="health" style="display:none"></div>
+
+    <div class="card">
+      <div class="card-title">Service</div>
+      <div class="actions">
+        <button data-action="start"   class="primary">Start</button>
+        <button data-action="stop">Stop</button>
+        <button data-action="restart">Restart</button>
+        <button id="btn-login" class="ghost">Login</button>
+      </div>
+      <div id="login-box" class="login-box" style="display:none">
+        <div class="hint">Open this link to authorise this device:</div>
+        <a id="login-url" href="#" target="_blank" rel="noopener"></a>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-title">Details</div>
+      <dl class="kv">
+        <dt>Module</dt>          <dd id="v-version">-</dd>
+        <dt>tailscaled</dt>      <dd id="v-daemon">-</dd>
+        <dt>Watchdog</dt>        <dd id="v-watchdog">-</dd>
+        <dt>TUN device</dt>      <dd id="v-iface">-</dd>
+        <dt>Tailnet address</dt> <dd id="v-ip">-</dd>
+        <dt>Routed prefixes</dt> <dd id="v-routes">-</dd>
+        <dt>Binary</dt>          <dd id="v-binary">-</dd>
+        <dt>Proxy exemptions</dt><dd id="v-exempt">-</dd>
+      </dl>
+      <p class="hint">
+        Exemptions are the three <code>RETURN</code> rules that keep tunnel
+        traffic out of a proxy's interception (pre&nbsp;=&nbsp;mangle&nbsp;PREROUTING,
+        out&nbsp;=&nbsp;mangle&nbsp;OUTPUT, nat&nbsp;=&nbsp;nat&nbsp;OUTPUT). All three
+        must read <code>OK</code>.
+      </p>
+    </div>
+  </section>
+
+  <!-- ---------------------------------------------------------- routes -->
+  <section id="panel-routes" style="display:none">
+    <div class="card">
+      <div class="card-title">Routed prefixes</div>
+      <p class="hint">
+        Destinations listed here are sent into the tunnel. One prefix per line,
+        <code>#</code> starts a comment. Add a peer's advertised subnet (for example
+        <code>192.168.100.0/24</code>) to reach its LAN from any browser.
+      </p>
+      <textarea id="routes" spellcheck="false" rows="12"></textarea>
+      <div class="actions">
+        <button id="btn-save" class="primary">Save &amp; apply</button>
+        <button id="btn-reset">Load default</button>
+      </div>
+      <p class="hint">
+        Remember that <code>tailscale set --accept-routes</code> must also be on,
+        otherwise tailscaled drops the packets it receives for those subnets.
+      </p>
+    </div>
+  </section>
+
+  <!-- ------------------------------------------------------------- log -->
+  <section id="panel-log" style="display:none">
+    <div class="card">
+      <div class="card-title">
+        Daemon log
+        <span class="right">
+          <button id="auto" class="chip">auto: off</button>
+          <button id="btn-log-refresh" class="chip">refresh</button>
+          <button id="btn-clear" class="chip">clear</button>
+        </span>
+      </div>
+      <pre id="log" class="code">loading…</pre>
+    </div>
+  </section>
+
+  <!-- ------------------------------------------------------------ diag -->
+  <section id="panel-diag" style="display:none">
+    <div class="card">
+      <div class="card-title">
+        Diagnostic dump
+        <span class="right"><button id="btn-diag-refresh" class="chip">refresh</button></span>
+      </div>
+      <p class="hint">
+        Start here when something is wrong: binary hash vs. expected, daemon and
+        watchdog PIDs, installed routes, the proxy exemption verdict, and the log tails.
+      </p>
+      <pre id="diag" class="code">loading…</pre>
+    </div>
+  </section>
+
+</main>
+
+<div id="toast" class="toast"></div>
+
+<script type="module" src="./app.js"></script>
+</body>
+</html>
