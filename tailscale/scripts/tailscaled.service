@@ -523,6 +523,220 @@ routes_reload() {
   add_routes
 }
 
+routes_sync() {
+  if [ -z "$(daemon_pid)" ] || [ ! -S "${tailscale_dir}/run/tailscaled.sock" ]; then
+    diag "routes-sync: daemon/socket not available"
+    return 1
+  fi
+
+  if ! "${tailscale_bin}" ${tailscale_bin_param} debug prefs 2>/dev/null | grep -q '"RouteAll": *true'; then
+    diag "routes-sync: --accept-routes is OFF, so the netmap carries no subnet routes"
+    return 2
+  fi
+
+  _json=$("${tailscale_bin}" ${tailscale_bin_param} status --json 2>/dev/null)
+  _found=$(printf '%s' "${_json}" | tr -d ' \n\t' \
+             | grep -o '"PrimaryRoutes":\[[^]]*\]' \
+             | grep -o '[0-9a-fA-F:.]\+/[0-9]\+' | sort -u)
+  _old=$(grep -E '^[0-9a-fA-F:.]+/[0-9]+$' "${tailscale_routes_auto_file}" 2>/dev/null | sort -u)
+
+  if [ "${_found}" = "${_old}" ]; then
+    diag "routes-sync: unchanged ($(printf '%s' "${_found}" | tr '\n' ' '))"
+    return 0
+  fi
+
+  {
+    echo "# Written by 'tailscaled.service routes-sync'. Regenerated automatically,"
+    echo "# so local edits here are lost - put your own entries in 'routes' instead."
+    echo "# Updated: $(date +'%Y-%m-%d %H:%M:%S')"
+    if [ -n "${_found}" ]; then
+      printf '%s\n' "${_found}"
+    else
+      echo "# no subnet routes visible yet - is --accept-routes on and the route"
+      echo "# approved in the admin console?"
+    fi
+  } > "${tailscale_routes_auto_file}" 2>/dev/null
+
+  diag "routes-sync: discovered [$(printf '%s' "${_found}" | tr '\n' ' ')]"
+  routes_reload
+  return 0
+}
+
+_jbool() {
+  _v=$(printf '%s' "$1" | grep -o "\"$2\": *[a-z]*" | head -n1 | sed 's/.*: *//')
+  case "${_v}" in true) echo 1 ;; *) echo 0 ;; esac
+}
+
+_jstr() {
+  printf '%s' "$1" | grep -o "\"$2\": *\"[^\"]*\"" | head -n1 | sed 's/.*"\([^"]*\)"$/\1/'
+}
+
+show_prefs() {
+  _p=$("${tailscale_bin}" ${tailscale_bin_param} debug prefs 2>/dev/null)
+  if [ -z "${_p}" ]; then
+    echo "prefs_ok=0"
+    return 1
+  fi
+  echo "prefs_ok=1"
+  echo "accept_routes=$(_jbool "${_p}" RouteAll)"
+  echo "accept_dns=$(_jbool "${_p}" CorpDNS)"
+  echo "shields_up=$(_jbool "${_p}" ShieldsUp)"
+  echo "want_running=$(_jbool "${_p}" WantRunning)"
+  echo "logged_out=$(_jbool "${_p}" LoggedOut)"
+  echo "hostname=$(_jstr "${_p}" Hostname)"
+  echo "exit_node=$(_jstr "${_p}" ExitNodeID)"
+  echo "advertise_routes=$(printf '%s' "${_p}" | tr -d ' \n' \
+        | grep -o '"AdvertiseRoutes":\[[^]]*\]' | grep -o '[0-9a-fA-F:.]\+/[0-9]\+' | tr '\n' ',')"
+  echo "discovered=$(grep -E '^[0-9a-fA-F:.]+/[0-9]+$' "${tailscale_routes_auto_file}" 2>/dev/null | tr '\n' ',')"
+}
+
+set_pref() {
+  _k=$1
+  _v=$2
+  case "$_k" in
+    accept-routes)      _flag="--accept-routes=$(_onoff "${_v}")" ;;
+    accept-dns)         _flag="--accept-dns=$(_onoff "${_v}")" ;;
+    shields-up)         _flag="--shields-up=$(_onoff "${_v}")" ;;
+    exit-node-allow-lan) _flag="--exit-node-allow-lan-access=$(_onoff "${_v}")" ;;
+    advertise-exit-node) _flag="--advertise-exit-node=$(_onoff "${_v}")" ;;
+    auto-update)        _flag="--auto-update=$(_onoff "${_v}")" ;;
+    hostname)
+      case "${_v}" in
+        *[!A-Za-z0-9.-]*|"") diag "set-pref: invalid hostname"; return 1 ;;
+      esac
+      _flag="--hostname=${_v}" ;;
+    advertise-routes)
+      case "${_v}" in
+        "") _flag="--advertise-routes=" ;;
+        *[!0-9a-fA-F:.,/]*) diag "set-pref: invalid route list"; return 1 ;;
+        *) _flag="--advertise-routes=${_v}" ;;
+      esac ;;
+    exit-node)
+      # Refused on purpose: see the note in the WebUI. Without SO_MARK the
+      # daemon's own packets would be routed back into its own tunnel.
+      diag "set-pref: exit-node is not supported by this module"
+      return 3 ;;
+    *)
+      diag "set-pref: unknown key [${_k}]"
+      return 1 ;;
+  esac
+  diag "set-pref: ${_k} -> ${_flag}"
+  if "${tailscale_bin}" ${tailscale_bin_param} set "${_flag}" >>"${tailscaled_diag_log}" 2>&1; then
+    return 0
+  fi
+  return 1
+}
+
+_onoff() {
+  case "$1" in
+    on|true|1|yes|enable) echo "true" ;;
+    *) echo "false" ;;
+  esac
+}
+
+logout_now() {
+  stop_watchdog
+  "${tailscale_bin}" ${tailscale_bin_param} logout >/dev/null 2>&1
+  "${tailscale_bin}" ${tailscale_bin_param} down >/dev/null 2>&1
+  diag "logout: done"
+  return 0
+}
+
+show_exemptions() {
+  for _spec in mangle:PREROUTING mangle:OUTPUT nat:OUTPUT; do
+    _t=${_spec%%:*}
+    _c=${_spec##*:}
+    if iptables -t "$_t" -L "$_c" -n >/dev/null 2>&1; then
+      _r=$(iptables -t "$_t" -L "$_c" -n -v --line-numbers 2>/dev/null | awk '$1 == 1 { print; exit }')
+      if echo "${_r}" | grep -q "${tun_iface}"; then
+        echo "  OK   ${_t}/${_c} rule 1: ${_r}"
+      else
+        echo "  BAD  ${_t}/${_c} rule 1: ${_r:-<empty>}   (tunnel traffic is NOT exempt)"
+      fi
+    else
+      echo "  --   ${_t}/${_c}: chain does not exist"
+    fi
+  done
+  if iptables -t mangle -L PREROUTING -n -v --line-numbers 2>/dev/null | grep -q DIVERT; then
+    echo "  note: a proxy DIVERT jump exists in mangle PREROUTING; the OK line above"
+    echo "        must come first or tailnet TCP (not ICMP) will be hijacked."
+  fi
+}
+
+show_diag() {
+  echo "=== tailscaled diagnostic ==="
+  echo "time:          $(date +'%Y-%m-%d %H:%M:%S')"
+  echo "binary:        ${tailscaled_bin}"
+  echo "  present:     $([ -f "${tailscaled_bin}" ] && echo yes || echo NO)"
+  echo "  hash:        $(hash_file "${tailscaled_bin}")"
+  echo "  pristine:    $([ -f "${tailscaled_bin_pristine}" ] && echo yes || echo NO)  expected hash: $(cat "${tailscaled_bin_sum}" 2>/dev/null)"
+  echo "daemon pid:    $(daemon_pid)"
+  echo "socket:        $([ -S "${tailscale_dir}/run/tailscaled.sock" ] && echo present || echo absent)"
+  echo "watchdog pid:  $(cat "${tailscaled_run_dir}/watchdog.pid" 2>/dev/null)"
+  echo "routes file:   ${tailscale_routes_file} $([ -f "${tailscale_routes_file}" ] && echo '(present)' || echo '(missing - using default 100.64.0.0/10)')"
+  echo ""
+  show_routes
+  echo ""
+  echo "tunnel exemptions (rule 1 of each chain must RETURN tunnel traffic):"
+  show_exemptions
+  echo ""
+  echo "daemon log (last 10 lines):"
+  tail -n 10 "${tailscaled_log}" 2>/dev/null | sed 's/^/  /'
+  echo ""
+  echo "--- recent diagnostic log ---"
+  tail -n 40 "${tailscaled_diag_log}" 2>/dev/null
+}
+
+log_view() {
+  case "$1" in
+    runs)       tail -n 200 -F "${tailscaled_runs_log}" ;;
+    service)    tail -n 200 -F "${tailscaled_service_log}" ;;
+    tailscaled) tail -n 200 -F "${tailscaled_log}" ;;
+    diag)       tail -n 200 -F "${tailscaled_diag_log}" ;;
+    *)
+      [ -n "$1" ] && echo "${scripts_name} log $1 not found"
+      echo "usage: ${scripts_name} log {runs|service|tailscaled|diag}"
+      ;;
+  esac
+}
+
+# One command that answers "is the right binary running, and where does it
+# break". Everything here is cheap, and it is meant to be pasted into a chat.
+selftest() {
+  echo "===== tailscaled selftest ====="
+  echo "module.prop      : $(awk -F'=' '/^id=/{printf $2" "} /^version=/{print $2}' "${module_prop}" 2>/dev/null)"
+  echo "binary           : ${tailscaled_bin}"
+  echo "binary sha256    : $(hash_file "${tailscaled_bin}")"
+  echo "guard expects    : $(cat "${tailscaled_bin_sum}" 2>/dev/null)"
+  echo "binary --version : $("${tailscaled_bin}" --version 2>&1 | head -n1)"
+  echo "binary arch      : $(od -A n -t x1 -N 20 "${tailscaled_bin}" 2>/dev/null | tr -d ' \n' | tail -c 4)  (b700 = arm64)"
+  echo "daemon pid       : $(daemon_pid)"
+  echo "routing mode     : $(osrouter_active && echo 'osrouter  <- expected for this module' || echo 'standalone  <- NOT this module')"
+  echo "default in main  : $(main_route_matches "$(detect_default_route)" && echo ok || echo MISSING)"
+  echo "rules -> table52 : $(ip rule show 2>/dev/null | grep -c 'lookup 52')"
+  echo "routes in table52: $(ip route show table 52 2>/dev/null | wc -l)"
+  echo "tun addresses    : $(ip -o -4 addr show "${tun_iface}" 2>/dev/null | awk '{print $4}' | tr '\n' ' ')"
+  echo "exemptions       : pre=$(_exempt_state mangle PREROUTING) out=$(_exempt_state mangle OUTPUT) nat=$(_exempt_state nat OUTPUT)"
+  echo "proxy jumps      : $(iptables -t mangle -L PREROUTING -n -v --line-numbers 2>/dev/null | awk '/DIVERT|BOX_/ {printf "%s:%s ", $1, $2}')"
+
+  if [ -n "$(daemon_pid)" ] && [ -S "${tailscale_dir}/run/tailscaled.sock" ]; then
+    echo "client version   : $("${tailscale_bin}" ${tailscale_bin_param} version 2>&1 | head -n1)"
+    _json=$("${tailscale_bin}" ${tailscale_bin_param} status --json 2>/dev/null)
+    echo "backend state    : $(printf '%s' "${_json}" | grep -o '"BackendState": *"[^"]*"' | head -n1 | sed 's/.*"\([^"]*\)"$/\1/')"
+    echo "self tailnet ip  : $("${tailscale_bin}" ${tailscale_bin_param} ip -4 2>/dev/null | head -n1)"
+    echo "accept-routes    : $("${tailscale_bin}" ${tailscale_bin_param} debug prefs 2>/dev/null | grep -o '"RouteAll": *[a-z]*' | sed 's/.*: *//')"
+    echo "reported OS      : $(printf '%s' "${_json}" | grep -o '"OS": *"[^"]*"' | head -n1 | sed 's/.*"\([^"]*\)"$/\1/')   <- 'linux' = this module, 'android' = another one is running"
+    _peer=$("${tailscale_bin}" ${tailscale_bin_param} status 2>/dev/null | tail -n +2 | awk 'NF>2 {print $1; exit}')
+    if [ -n "${_peer}" ]; then
+      echo "tailscale ping   : $("${tailscale_bin}" ${tailscale_bin_param} ping --timeout=6s -c 3 "${_peer}" 2>&1 | tr '\n' ' ')"
+      echo "kernel ping      : $(ping -c 2 -W 3 "${_peer}" 2>&1 | tail -n 1)"
+    fi
+  else
+    echo "daemon           : NOT RUNNING (press Start first)"
+  fi
+  echo "===== end selftest ====="
+}
+
 # ------------------------------------------------------------------ dispatch --
 case "$1" in
   start)      start_tailscaled ;;
@@ -538,8 +752,9 @@ case "$1" in
   set-pref)   set_pref "$2" "$3" ;;
   logout)     logout_now ;;
   log)        log_view "$2" ;;
+  selftest)   selftest ;;
   __watchdog) route_watchdog ;;
   *)
-    echo "usage: ${scripts_name} {start|stop|restart|status|routes|routes-reload|routes-sync|diag|webstatus|prefs|set-pref <key> <value>|logout|log{runs|service|tailscaled|diag}}"
+    echo "usage: ${scripts_name} {start|stop|restart|status|routes|routes-reload|routes-sync|diag|webstatus|prefs|set-pref <key> <value>|logout|selftest|log{runs|service|tailscaled|diag}}"
     ;;
 esac

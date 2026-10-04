@@ -24,6 +24,29 @@ osrouter puts the tailnet prefixes and **any subnet route you accept** into tabl
 su -c 'tailscale set --accept-routes'
 ```
 
+## New: `tailscaled.service selftest`
+
+One command that answers "is the right binary running, and where does it break" —
+binary hash vs. the guard, the binary's own version and arch, the routing mode,
+the main-table default, table 52, the proxy exemptions, the reported OS, and a
+`tailscale ping` plus a kernel `ping` against a real peer. Paste its output.
+
+```
+su -c 'tailscaled.service selftest'
+```
+
+If `reported OS` says `android`, some other module's binary is running, not this
+one — this build reports `linux`.
+
+## Fixed in this build
+
+`show_diag`, `log_view`, `show_prefs`, `set_pref`, `routes_sync`, `logout_now`,
+`show_exemptions`, `_jbool`, `_jstr` and `_onoff` had been dropped from the
+service script by a bad edit, which left `tailscaled.service diag|log|prefs|
+set-pref|routes-sync|logout` and the WebUI's Settings and Log tabs calling
+functions that did not exist. All restored, and every command the dispatcher
+references is now checked to exist.
+
 ## Simpler, faster WebUI
 
 Three tabs instead of five, and no route editing to do:
