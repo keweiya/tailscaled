@@ -23,6 +23,19 @@ if [ -f "$INSTALL_DIR/scripts/tailscaled.service" ]; then
   "$INSTALL_DIR/scripts/tailscaled.service" stop >/dev/null 2>&1
 fi
 
+# Belt and braces. The binary is replaced with cp -f, i.e. in place, so a daemon
+# that another module started keeps executing the OLD code while the file on disk
+# (and its hash) is already ours. Kill anything still using our state directory
+# regardless of which module launched it.
+for _p in $(pgrep -f "statedir=${INSTALL_DIR}/run" 2>/dev/null); do
+  kill -15 "$_p" 2>/dev/null
+done
+sleep 1
+for _p in $(pgrep -f "statedir=${INSTALL_DIR}/run" 2>/dev/null); do
+  ui_print "  killing stale tailscaled pid $_p"
+  kill -9 "$_p" 2>/dev/null
+done
+
 ui_print "- Creating directories"
 mkdir -p "$INSTALL_DIR" "$INSTALL_BIN_DIR" "$SERVICE_DIR"
 

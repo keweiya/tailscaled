@@ -24,6 +24,39 @@ osrouter puts the tailnet prefixes and **any subnet route you accept** into tabl
 su -c 'tailscale set --accept-routes'
 ```
 
+## Fixed: an install over another module's running daemon never took effect
+
+`customize.sh` replaces the binary with `cp -f`, which overwrites **in place**. A
+`tailscaled` that another module had already started therefore keeps executing the
+old code, while the file on disk — and its hash — is already this module's. The
+service then saw "a daemon is already running" and skipped starting its own, so
+the module appeared installed and healthy while the previous build was still
+running the show. That is why `mode:` read *standalone (no osrouter)* even though
+this is a linux build with osrouter linked in.
+
+- `customize.sh` now kills anything still using the state directory, whatever
+  launched it.
+- `daemon_is_current()` compares the process start time (`/proc/<pid>`) against
+  the binary's mtime, and `start` restarts the daemon when it predates the binary.
+- "Which build is this" is now answered by inspecting the **binary**
+  (`has_osrouter`: does it link `ts-postrouting`?), not by guessing from the
+  routing tables.
+- The WebUI and `selftest` report it: *STALE, restart*.
+
+## Fixed: broken helpers when installing over another module
+
+`settings.ini` is deliberately kept on upgrade, so it can be one written by a
+different module with no `diag()`/`log()`/`setup_home()`. Every `diag` call then
+printed `diag: inaccessible or not found`. The service now defines whatever the
+settings file does not.
+
+## Changed: our own routes are installed unconditionally, at preference 5300
+
+They used to be installed only for a "standalone" build, and at preference 12000
+— which netd's `11000: from all iif lo lookup 1002` beats, making them useless.
+Both osrouter's `5270` and ours (`5300`) now win over netd, and ours exists as a
+fallback for the case where osrouter's routing is missing.
+
 ## New: `tailscaled.service selftest`
 
 One command that answers "is the right binary running, and where does it break" —

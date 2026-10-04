@@ -36,7 +36,14 @@ scripts_name=$(basename "$0")
 : "${sync_every_ticks:=4}"
 : "${tun_iface:=tailscale0}"
 : "${tun_table:=1099}"
-: "${tun_rule_pref:=12000}"
+: "${tun_rule_pref:=5300}"
+
+# The module deliberately keeps an existing settings.ini on upgrade, so it can be
+# one written by a different module that has no diag()/log(). Define whatever is
+# missing instead of printing "diag: inaccessible or not found" everywhere.
+type diag >/dev/null 2>&1 || diag() { printf '%s %s\n' "$(date +'%Y-%m-%d %H:%M:%S')" "$*" >> "${tailscaled_diag_log:-/dev/null}" 2>/dev/null; }
+type log >/dev/null 2>&1 || log() { printf '%s [%s]: %s\n' "$(date +'%Y-%m-%d %H:%M:%S')" "$1" "$2" >> "${tailscaled_runs_log:-/dev/null}" 2>/dev/null; }
+type setup_home >/dev/null 2>&1 || setup_home() { export HOME=/data/ssh/root; mkdir -p "$HOME" 2>/dev/null; }
 
 # ---------------------------------------------------------------- helpers ---
 daemon_pid() {
@@ -177,9 +184,33 @@ main_route_matches() {
   fi
 }
 
-# Is this a linux build with osrouter running? It installs a rule into table 52.
-osrouter_active() {
-  ip rule show 2>/dev/null | grep -q 'lookup 52$'
+# Does this binary link osrouter in? That is a property of the build (GOOS=linux
+# does, GOOS=android does not), not of the current routing state - asking the
+# routing tables instead is how an old daemon that was never restarted gets
+# mistaken for this module's build. Cached: one grep per script run.
+_HAS_OSROUTER=""
+has_osrouter() {
+  if [ -z "${_HAS_OSROUTER}" ]; then
+    if grep -aq 'ts-postrouting' "${tailscaled_bin}" 2>/dev/null; then
+      _HAS_OSROUTER=1
+    else
+      _HAS_OSROUTER=0
+    fi
+  fi
+  [ "${_HAS_OSROUTER}" = "1" ]
+}
+
+# Did the running daemon start before the current binary was put in place? cp -f
+# overwrites in place, so an already-running process keeps executing the previous
+# code while /proc/<pid>/exe and the hash on disk both look correct. Without this
+# check an install over another module's running daemon never takes effect.
+daemon_is_current() {
+  _p=$(daemon_pid)
+  [ -n "${_p}" ] || return 1
+  _bm=$(stat -c %Y "${tailscaled_bin}" 2>/dev/null)
+  _pm=$(stat -c %Y "/proc/${_p}" 2>/dev/null)
+  [ -n "${_bm}" ] && [ -n "${_pm}" ] || return 0   # cannot tell -> assume fine
+  [ "${_pm}" -ge "${_bm}" ]
 }
 
 # Re-add the bypass-mark rules if something dropped them (only meaningful when
@@ -223,19 +254,16 @@ fix_controlplane_routing() {
 
 routes_ok() {
   ip link show "${tun_iface}" >/dev/null 2>&1 || return 1
-  if osrouter_active; then
-    # tailscaled owns the destination routing (table 52). The only thing that
-    # needs maintaining is a usable default route in `main` for its
-    # bypass-marked sockets.
-    main_route_matches "$(detect_default_route)" || return 1
-    return 0
-  fi
   _prefixes=$(route_prefixes)
-  [ -n "${_prefixes}" ] || return 1
-  for _pfx in ${_prefixes}; do
-    ip route show table "${tun_table}" 2>/dev/null | grep -q "^${_pfx} " || return 1
-    ip rule show 2>/dev/null | grep -q "to ${_pfx} lookup ${tun_table}" || return 1
-  done
+  if [ -n "${_prefixes}" ]; then
+    for _pfx in ${_prefixes}; do
+      ip route show table "${tun_table}" 2>/dev/null | grep -q "^${_pfx} " || return 1
+      ip rule show 2>/dev/null | grep -q "to ${_pfx} lookup ${tun_table}" || return 1
+    done
+  fi
+  # The daemon's own sockets need a default route in `main` (see
+  # fix_controlplane_routing). Losing it is the failure that keeps the node down.
+  main_route_matches "$(detect_default_route)" || return 1
   return 0
 }
 
@@ -275,44 +303,48 @@ _exempt_one() {
 
 add_routes() {
   wait_tun || return 1
-  if osrouter_active; then
-    # Normal case for this build: osrouter puts the tailnet prefixes and any
-    # accepted subnet routes into table 52 by itself, at a rule preference ahead
-    # of netd's. Do not duplicate it.
-    diag "routes: osrouter active (table 52) - tailscaled installs the routes itself"
-  else
-    for _pfx in $(route_prefixes); do
-      if ip route replace "${_pfx}" dev "${tun_iface}" table "${tun_table}" 2>/dev/null; then
-        diag "routes: table ${tun_table}: ${_pfx} dev ${tun_iface}"
-      else
-        diag "routes: WARN could not add ${_pfx} to table ${tun_table}"
-      fi
-      ip route replace "${_pfx}" dev "${tun_iface}" metric 1 2>/dev/null
-      if ip rule show 2>/dev/null | grep -q "to ${_pfx} lookup ${tun_table}"; then
-        diag "routes: rule to ${_pfx} already present"
-      elif ip rule add to "${_pfx}" lookup "${tun_table}" pref "${tun_rule_pref}" 2>/dev/null; then
-        diag "routes: rule to ${_pfx} lookup ${tun_table} pref ${tun_rule_pref}"
-      else
-        diag "routes: WARN could not add rule for ${_pfx}"
-      fi
-    done
-  fi
+  # Installed unconditionally, even when osrouter is present. osrouter's own rule
+  # sits at preference 5270, so ours (5300) is only reached if osrouter's routing
+  # is missing - which is exactly the case it exists for. Both are ahead of
+  # netd's 11000, which is what mgksu-style rules at 32765 get wrong.
+  for _pfx in $(route_prefixes); do
+    if ip route replace "${_pfx}" dev "${tun_iface}" table "${tun_table}" 2>/dev/null; then
+      diag "routes: table ${tun_table}: ${_pfx} dev ${tun_iface}"
+    else
+      diag "routes: WARN could not add ${_pfx} to table ${tun_table}"
+    fi
+    ip route replace "${_pfx}" dev "${tun_iface}" metric 1 2>/dev/null
+    if ip rule show 2>/dev/null | grep -q "to ${_pfx} lookup ${tun_table}"; then
+      diag "routes: rule to ${_pfx} already present"
+    elif ip rule add to "${_pfx}" lookup "${tun_table}" pref "${tun_rule_pref}" 2>/dev/null; then
+      diag "routes: rule to ${_pfx} lookup ${tun_table} pref ${tun_rule_pref}"
+    else
+      diag "routes: WARN could not add rule for ${_pfx}"
+    fi
+  done
   fix_controlplane_routing
   exempt_tunnel
   return 0
 }
 
 del_routes() {
-  for _pfx in $(route_prefixes); do
-    ip rule del to "${_pfx}" lookup "${tun_table}" pref "${tun_rule_pref}" 2>/dev/null
-    ip route del "${_pfx}" dev "${tun_iface}" metric 1 2>/dev/null
+  # Remove every rule that points at our table, whatever preference it has: an
+  # upgrade may have used a different pref, and leaving those behind would keep
+  # sending traffic to a table we are about to empty.
+  _guard=0
+  while [ "${_guard}" -lt 100 ]; do
+    _p=$(ip rule show 2>/dev/null | grep "lookup ${tun_table}\$" | head -n1 | awk -F: '{print $1}')
+    [ -n "${_p}" ] || break
+    ip rule del pref "${_p}" 2>/dev/null || break
+    _guard=$((_guard + 1))
+  done
+  ip route show 2>/dev/null | grep "dev ${tun_iface} metric 1" | while read -r _r; do
+    ip route del ${_r} 2>/dev/null
   done
   ip route flush table "${tun_table}" 2>/dev/null
   diag "routes: removed"
 }
 
-# Android's netd rewrites the routing tables on every network transition, and a
-# proxy may reload its firewall at any time, so re-assert periodically.
 route_watchdog() {
   _tick=0
   while :; do
@@ -356,12 +388,18 @@ stop_watchdog() {
 start_tailscaled() {
   _pid=$(daemon_pid)
   if [ -n "${_pid}" ]; then
-    log Info "tailscaled already running (PID ${_pid})."
-    diag "start: already running (PID ${_pid})"
-    add_routes
-    start_watchdog
-    [ "${sync_routes_auto}" = "1" ] && routes_sync
-    return 0
+    if daemon_is_current; then
+      log Info "tailscaled already running (PID ${_pid})."
+      diag "start: already running (PID ${_pid}), started after the current binary"
+      add_routes
+      start_watchdog
+      [ "${sync_routes_auto}" = "1" ] && routes_sync
+      return 0
+    fi
+    log Warning "PID ${_pid} started before the current binary was installed - restarting it"
+    diag "start: stale daemon (PID ${_pid}) predates ${tailscaled_bin} - stopping it"
+    stop_tailscaled
+    sleep 1
   fi
   ensure_binary || return 1
   setup_home
@@ -416,32 +454,24 @@ show_status() {
 }
 
 show_routes() {
-  if osrouter_active; then
-    echo "mode:                    osrouter (linux build) - tailscaled owns the routing"
-    if main_route_matches "$(detect_default_route)"; then
-      echo "default route in main:   $(ip route show table main 2>/dev/null | grep '^default' | head -n1)"
-    else
-      echo "default route in main:   NONE  <-- the control plane will fail"
-    fi
-    echo "tailnet in table 52:"
-    ip route show table 52 2>/dev/null | sed 's/^/  /'
-    echo "bypass rules:"
-    ip rule show 2>/dev/null | grep '0x10020000' | sed 's/^/  /'
+  if has_osrouter; then
+    echo "build:                   linux + osrouter"
   else
-    echo "mode:                    standalone (no osrouter) - this module owns the routing"
-    echo "manual (routes):         $(grep -E '^[0-9a-fA-F:.]+/[0-9]+$' "${tailscale_routes_file}" 2>/dev/null | tr '\n' ' ')"
-    echo "discovered (routes.auto): $(grep -E '^[0-9a-fA-F:.]+/[0-9]+$' "${tailscale_routes_auto_file}" 2>/dev/null | tr '\n' ' ')"
-    echo "in use:                  $(route_prefixes | tr '\n' ' ')"
-    echo "table ${tun_table}:"
-    ip route show table "${tun_table}" 2>/dev/null | sed 's/^/  /'
-    echo "ip rules:"
-    ip rule show 2>/dev/null | grep "to .* lookup ${tun_table}" | sed 's/^/  /'
+    echo "build:                   standalone (no osrouter)"
   fi
+  echo "manual (routes):         $(grep -E '^[0-9a-fA-F:.]+/[0-9]+$' "${tailscale_routes_file}" 2>/dev/null | tr '\n' ' ')"
+  echo "discovered (routes.auto):$(grep -E '^[0-9a-fA-F:.]+/[0-9]+$' "${tailscale_routes_auto_file}" 2>/dev/null | sed 's/^/ /' | tr '\n' ' ')"
+  echo "in use:                  $(route_prefixes | tr '\n' ' ')"
+  echo "table ${tun_table}:"
+  ip route show table "${tun_table}" 2>/dev/null | sed 's/^/  /'
+  echo "rules -> table ${tun_table}:"
+  ip rule show 2>/dev/null | grep "lookup ${tun_table}" | sed 's/^/  /'
+  echo "default route in main:   $(main_route_matches "$(detect_default_route)" && echo ok || echo 'MISSING - control plane will fail')"
+  echo "osrouter table 52:       $(ip rule show 2>/dev/null | grep -c 'lookup 52') rule(s), $(ip route show table 52 2>/dev/null | wc -l) route(s)"
   echo "tun device:              ${tun_iface} $([ -d /sys/class/net/${tun_iface} ] && echo '(up)' || echo '(down)')"
+  echo "daemon freshness:        $(daemon_is_current && echo 'current' || echo 'STALE or stopped - run: tailscaled.service restart')"
 }
 
-# --------------------------------------------------------- WebUI helpers ---
-# Verdict for one chain: is rule 1 a RETURN for tunnel traffic?
 _exempt_state() {
   _t=$1
   _c=$2
@@ -478,13 +508,9 @@ show_webstatus() {
     echo "binary_ok=0"
   fi
 
-  if osrouter_active; then
-    echo "osrouter=1"
-    if main_route_matches "$(detect_default_route)"; then echo "main_default=ok"; else echo "main_default=NONE"; fi
-  else
-    echo "osrouter=0"
-    echo "main_default=n/a"
-  fi
+  has_osrouter && echo "osrouter=1" || echo "osrouter=0"
+  daemon_is_current && echo "daemon_current=1" || echo "daemon_current=0"
+  if main_route_matches "$(detect_default_route)"; then echo "main_default=ok"; else echo "main_default=NONE"; fi
   echo "exempt_prerouting=$(_exempt_state mangle PREROUTING)"
   echo "exempt_output=$(_exempt_state mangle OUTPUT)"
   echo "exempt_nat=$(_exempt_state nat OUTPUT)"
@@ -711,8 +737,12 @@ selftest() {
   echo "binary --version : $("${tailscaled_bin}" --version 2>&1 | head -n1)"
   echo "binary arch      : $(od -A n -t x1 -N 20 "${tailscaled_bin}" 2>/dev/null | tr -d ' \n' | tail -c 4)  (b700 = arm64)"
   echo "daemon pid       : $(daemon_pid)"
-  echo "routing mode     : $(osrouter_active && echo 'osrouter  <- expected for this module' || echo 'standalone  <- NOT this module')"
+  echo "build            : $(has_osrouter && echo 'linux + osrouter  <- expected for this module' || echo 'standalone (no osrouter)  <- NOT our linux build')"
+  echo "daemon freshness : $(daemon_is_current && echo current || echo 'STALE or stopped  <- the running process predates this binary')"
+  echo "daemon started   : $(stat -c %y "/proc/$(daemon_pid)" 2>/dev/null | cut -d. -f1)"
+  echo "binary written   : $(stat -c %y "${tailscaled_bin}" 2>/dev/null | cut -d. -f1)"
   echo "default in main  : $(main_route_matches "$(detect_default_route)" && echo ok || echo MISSING)"
+  echo "our ip rules     : $(ip rule show 2>/dev/null | grep -c "lookup ${tun_table}")  (to <prefix> lookup ${tun_table} pref ${tun_rule_pref})"
   echo "rules -> table52 : $(ip rule show 2>/dev/null | grep -c 'lookup 52')"
   echo "routes in table52: $(ip route show table 52 2>/dev/null | wc -l)"
   echo "tun addresses    : $(ip -o -4 addr show "${tun_iface}" 2>/dev/null | awk '{print $4}' | tr '\n' ' ')"

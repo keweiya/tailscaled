@@ -67,7 +67,9 @@ async function refreshStatus({ announce = false } = {}) {
     : 'tailscaled is not running');
 
   setText('v-module', s.version || '-');
-  setText('v-daemon', running ? `running (${s.pid || '?'})` : 'stopped');
+  const stale = running && s.daemon_current === '0';
+  setText('v-daemon', running ? `running (${s.pid || '?'})${stale ? ' — STALE, restart' : ''}` : 'stopped', stale ? 'bad' : '');
+  setText('v-build', s.osrouter === '1' ? 'linux + osrouter' : 'standalone (no osrouter)', s.osrouter === '1' ? '' : 'warn');
   setText('v-ip', s.ip4 || '-');
   setText('v-backend', backend || '-');
   setText('v-user', s.user || '-');
@@ -88,6 +90,7 @@ async function refreshStatus({ announce = false } = {}) {
 
   const problems = [];
   if (!running) problems.push('tailscaled is not running — press Start, then check the Log tab.');
+  if (running && s.daemon_current === '0') problems.push('The running daemon was started before this module was installed, so the old binary is still executing — press Restart.');
   if (running && mainBad) problems.push('The main routing table has no default route, so the control plane cannot connect. Press Restart; if it persists, send me the Log.');
   if (running && backend && backend !== 'Running' && backend !== 'NeedsLogin') problems.push(`Backend state is "${backend}".`);
   if (running && backend === 'NeedsLogin') problems.push('Not logged in yet — press Login.');
