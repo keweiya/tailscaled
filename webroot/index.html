@@ -20,27 +20,23 @@
 </header>
 
 <nav class="tabs">
-  <button id="tab-status" class="tab">Status</button>
-  <button id="tab-routes" class="tab">Routes</button>
-  <button id="tab-features" class="tab">Features</button>
-  <button id="tab-log"    class="tab">Log</button>
-  <button id="tab-diag"   class="tab">Diagnostics</button>
+  <button id="tab-status"   class="tab">Status</button>
+  <button id="tab-settings" class="tab">Settings</button>
+  <button id="tab-log"      class="tab">Log</button>
 </nav>
 
 <main>
 
-  <!-- ---------------------------------------------------------- status -->
+  <!-- ============================================================ status -->
   <section id="panel-status">
     <div id="health" class="health" style="display:none"></div>
 
     <div class="card">
-      <div class="card-title">Service</div>
       <div class="actions">
         <button data-action="start"   class="primary">Start</button>
         <button data-action="stop">Stop</button>
         <button data-action="restart">Restart</button>
         <button id="btn-login" class="ghost">Login</button>
-        <button id="btn-logout" class="danger">Log out</button>
       </div>
       <div id="login-box" class="login-box" style="display:none">
         <div class="hint">Open this link to authorise this device:</div>
@@ -49,74 +45,47 @@
     </div>
 
     <div class="card">
-      <div class="card-title">Details</div>
       <dl class="kv">
-        <dt>Module</dt>          <dd id="v-version">-</dd>
+        <dt>Module</dt>          <dd id="v-module">-</dd>
         <dt>tailscaled</dt>      <dd id="v-daemon">-</dd>
-        <dt>Watchdog</dt>        <dd id="v-watchdog">-</dd>
-        <dt>TUN device</dt>      <dd id="v-iface">-</dd>
         <dt>Tailnet address</dt> <dd id="v-ip">-</dd>
-        <dt>Routed prefixes</dt> <dd id="v-routes">-</dd>
-        <dt>Binary</dt>          <dd id="v-binary">-</dd>
-        <dt>Proxy exemptions</dt><dd id="v-exempt">-</dd>
+        <dt>Backend</dt>         <dd id="v-backend">-</dd>
+        <dt>Account</dt>         <dd id="v-user">-</dd>
+      </dl>
+    </div>
+
+    <div class="card">
+      <div class="card-title">Health checks</div>
+      <dl class="kv">
+        <dt>Binary</dt>
+            <dd id="v-binary">-</dd>
+        <dt>Default route</dt>
+            <dd id="v-main">-</dd>
+        <dt>Proxy exemption</dt>
+            <dd id="v-exempt">-</dd>
       </dl>
       <p class="hint">
-        Exemptions are the three <code>RETURN</code> rules that keep tunnel
-        traffic out of a proxy's interception (pre&nbsp;=&nbsp;mangle&nbsp;PREROUTING,
-        out&nbsp;=&nbsp;mangle&nbsp;OUTPUT, nat&nbsp;=&nbsp;nat&nbsp;OUTPUT). All three
-        must read <code>OK</code>.
+        <b>Default route</b> must be OK: tailscaled's own traffic is routed through
+        a routing table Android leaves empty, and without a default there it cannot
+        reach the control plane at all.
+        <b>Proxy exemption</b> keeps a TPROXY proxy (Surfing/Clash) from hijacking
+        the tunnel's TCP replies.
       </p>
     </div>
   </section>
 
-  <!-- ---------------------------------------------------------- routes -->
-  <section id="panel-routes" style="display:none">
-    <div class="card">
-      <div class="card-title">Routed prefixes</div>
-      <p class="hint">
-        Destinations listed here are sent into the tunnel. One prefix per line,
-        <code>#</code> starts a comment. Add a peer's advertised subnet (for example
-        <code>192.168.100.0/24</code>) to reach its LAN from any browser.
-      </p>
-      <textarea id="routes" spellcheck="false" rows="12"></textarea>
-      <div class="actions">
-        <button id="btn-save" class="primary">Save &amp; apply</button>
-        <button id="btn-reset">Load default</button>
-      </div>
-      <p class="hint">
-        Remember that <code>tailscale set --accept-routes</code> must also be on,
-        otherwise tailscaled drops the packets it receives for those subnets.
-      </p>
-    </div>
-
+  <!-- ========================================================== settings -->
+  <section id="panel-settings" style="display:none">
     <div class="card">
       <div class="card-title">
-        Discovered subnets
-        <span class="right"><button id="btn-discover" class="chip">discover</button></span>
-      </div>
-      <p class="hint">
-        Reads the subnet routes the control plane says are reachable
-        (<code>Peer.PrimaryRoutes</code>), writes them to
-        <code>routes.auto</code> and installs them. This file is regenerated
-        automatically, so your own entries in <code>routes</code> are never touched.
-        Requires <b>Accept subnet routes</b> to be on.
-      </p>
-      <div id="discovered" class="code small">(not discovered yet)</div>
-    </div>
-  </section>
-
-  <!-- --------------------------------------------------------- features -->
-  <section id="panel-features" style="display:none">
-    <div class="card">
-      <div class="card-title">
-        Tailscale features
+        Features
         <span class="right"><button id="btn-prefs-refresh" class="chip">refresh</button></span>
       </div>
 
       <label class="switch-row">
         <span>
           <b>Accept subnet routes</b>
-          <em>Required before any subnet route can reach this device. Turn this on, then use <i>Discover</i> on the Routes tab.</em>
+          <em>Turn this on to reach a peer's LAN (for example <code>192.168.100.0/24</code>). tailscaled then installs those routes itself — nothing else to configure.</em>
         </span>
         <input type="checkbox" id="sw-accept-routes">
       </label>
@@ -124,7 +93,7 @@
       <label class="switch-row">
         <span>
           <b>Accept DNS (MagicDNS)</b>
-          <em>Keep this off: MagicDNS needs a local DNS listener that does not exist in this setup.</em>
+          <em>Leave off: MagicDNS needs a local DNS listener that does not exist here.</em>
         </span>
         <input type="checkbox" id="sw-accept-dns">
       </label>
@@ -140,7 +109,7 @@
       <label class="switch-row">
         <span>
           <b>Advertise as an exit node</b>
-          <em>Lets <i>other</i> devices route their internet traffic through this phone.</em>
+          <em>Lets <i>other</i> devices send their internet traffic through this phone.</em>
         </span>
         <input type="checkbox" id="sw-advertise-exit-node">
       </label>
@@ -156,63 +125,42 @@
     </div>
 
     <div class="card">
-      <div class="card-title">Advertised routes (this device as a subnet router)</div>
-      <div class="row">
-        <input id="in-advertise" type="text" spellcheck="false" placeholder="192.168.1.0/24,10.0.0.0/8">
-        <button id="btn-advertise" class="primary">Set</button>
-      </div>
-      <p class="hint">Comma-separated CIDRs. Routes must be approved in the admin console.</p>
-    </div>
-
-    <div class="card">
       <div class="card-title">Not available in this build</div>
       <ul class="notes">
         <li>
-          <b>Use an exit node</b> — impossible here. A <code>GOOS=android</code>
-          tailscaled cannot mark its own sockets, so routing <code>0.0.0.0/0</code>
-          into the tunnel would send the daemon's own packets back into its own
-          tunnel and stall it. The module refuses this on purpose.
+          <b>Use an exit node</b> — only advertising this device works. Routing
+          <code>0.0.0.0/0</code> through the tunnel from this side is not supported
+          here, and is refused on purpose.
         </li>
         <li>
-          <b>Tailscale SSH</b> — built with <code>ts_omit_ssh</code>:
-          <code>feature/ssh</code> excludes android while
-          <code>cmd/tailscaled/ssh.go</code> does not, so it cannot be linked.
+          <b>Tailscale SSH</b> — built with <code>ts_omit_ssh</code>.
         </li>
         <li>
-          <b>Automatic updates</b> — forced off. An upstream update installs the
-          linux build, which blocks the link; the binary guard reverts it.
+          <b>Automatic updates</b> — forced off, and the CLI refuses
+          <code>tailscale update</code>. It installs the stock binary, which
+          misroutes the daemon's traffic on Android and blocks the link.
         </li>
       </ul>
+      <div class="actions">
+        <button id="btn-logout" class="danger">Log out</button>
+      </div>
     </div>
   </section>
 
-  <!-- ------------------------------------------------------------- log -->
+  <!-- =============================================================== log -->
   <section id="panel-log" style="display:none">
     <div class="card">
       <div class="card-title">
-        Daemon log
+        <span id="src-label">Daemon log</span>
         <span class="right">
+          <button id="btn-src-daemon" class="chip on">daemon</button>
+          <button id="btn-src-diag" class="chip">diagnostics</button>
           <button id="auto" class="chip">auto: off</button>
           <button id="btn-log-refresh" class="chip">refresh</button>
           <button id="btn-clear" class="chip">clear</button>
         </span>
       </div>
-      <pre id="log" class="code">loading…</pre>
-    </div>
-  </section>
-
-  <!-- ------------------------------------------------------------ diag -->
-  <section id="panel-diag" style="display:none">
-    <div class="card">
-      <div class="card-title">
-        Diagnostic dump
-        <span class="right"><button id="btn-diag-refresh" class="chip">refresh</button></span>
-      </div>
-      <p class="hint">
-        Start here when something is wrong: binary hash vs. expected, daemon and
-        watchdog PIDs, installed routes, the proxy exemption verdict, and the log tails.
-      </p>
-      <pre id="diag" class="code">loading…</pre>
+      <pre id="out" class="code">loading…</pre>
     </div>
   </section>
 

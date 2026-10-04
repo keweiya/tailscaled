@@ -1,13 +1,12 @@
 import { exec, toast as nativeToast } from './ksu.js';
 
 const STATE_DIR = '/data/adb/tailscale';
-const ROUTES_FILE = `${STATE_DIR}/routes`;
 const DAEMON_LOG = `${STATE_DIR}/run/tailscaled.log`;
 const DIAG_LOG = `${STATE_DIR}/run/diag.log`;
 const SVC = 'tailscaled.service';
 
 const $ = (id) => document.getElementById(id);
-const state = { status: {}, prefs: {}, busy: false, autoLog: false, logTimer: null };
+const state = { status: {}, busy: false, source: 'daemon', auto: false, timer: null };
 
 /* ------------------------------------------------------------------ toast -- */
 function toast(message, kind = 'info') {
@@ -31,11 +30,9 @@ async function run(command, { quiet = false } = {}) {
 
 function setBusy(busy) {
   state.busy = busy;
-  document.querySelectorAll('button[data-action]').forEach((b) => { b.disabled = busy; });
-  $('refresh').disabled = busy;
+  document.querySelectorAll('button').forEach((b) => { b.disabled = busy; });
 }
 
-/* ---------------------------------------------------------------- status ---- */
 function parseKv(text) {
   const out = {};
   text.split('\n').forEach((line) => {
@@ -45,43 +42,61 @@ function parseKv(text) {
   return out;
 }
 
-async function refreshStatus({ silent = true } = {}) {
+function setText(id, value, cls = '') {
+  const el = $(id);
+  if (el.textContent !== value) el.textContent = value;
+  if (el.className !== cls) el.className = cls;
+}
+
+/* ---------------------------------------------------------------- status ---- */
+async function refreshStatus({ announce = false } = {}) {
   const res = await run(`${SVC} webstatus`, { quiet: true });
-  if (res.errno !== 0 && !res.stdout) {
-    $('status-main').textContent = 'unavailable';
-    $('dot').className = 'dot bad';
-    return;
-  }
-  const s = parseKv(res.stdout);
+  const s = parseKv(res.stdout || '');
   state.status = s;
 
   const running = s.daemon === '1';
-  $('dot').className = `dot ${running ? (s.backend === 'Running' ? 'good' : 'warn') : 'bad'}`;
-  $('status-main').textContent = running
-    ? (s.backend || 'running')
-    : 'stopped';
-  $('status-sub').textContent = running
+  const backend = s.backend || '';
+  const mainBad = s.osrouter === '1' && s.main_default !== 'ok';
+
+  $('dot').className = `dot ${
+    !running ? 'bad' : mainBad ? 'warn' : (backend === 'Running' ? 'good' : 'warn')
+  }`;
+  setText('status-main', running ? (backend || 'running') : 'stopped');
+  setText('status-sub', running
     ? `${s.ip4 || 'no address'}${s.user ? ` · ${s.user}` : ''}`
-    : 'tailscaled is not running';
+    : 'tailscaled is not running');
 
-  $('v-version').textContent = s.version || '-';
-  $('v-daemon').textContent = running ? `running (${s.pid || '?'})` : 'stopped';
-  $('v-watchdog').textContent = s.watchdog === '1' ? `running (${s.watchdog_pid || '?'})` : 'not running';
-  $('v-iface').textContent = s.iface || '-';
-  $('v-ip').textContent = s.ip4 || '-';
-  $('v-routes').textContent = s.routes || '-';
-  $('v-binary').textContent = s.binary_ok === '1' ? 'verified (matches pristine copy)' : 'CHANGED - will be restored';
-  $('v-binary').className = s.binary_ok === '1' ? '' : 'bad';
+  setText('v-module', s.version || '-');
+  setText('v-daemon', running ? `running (${s.pid || '?'})` : 'stopped');
+  setText('v-ip', s.ip4 || '-');
+  setText('v-backend', backend || '-');
+  setText('v-user', s.user || '-');
 
-  const ex = `${s.exempt_prerouting || '?'} / ${s.exempt_output || '?'} / ${s.exempt_nat || '?'}`;
-  $('v-exempt').textContent = `${ex} (pre/out/nat)`;
-  $('v-exempt').className = (s.exempt_prerouting === 'OK' && s.exempt_output === 'OK')
-    ? '' : 'warn';
+  const binOk = s.binary_ok === '1';
+  setText('v-binary', binOk ? 'OK — matches the module build' : 'CHANGED — will be restored', binOk ? '' : 'bad');
 
-  $('health').textContent = s.health || '';
-  $('health').style.display = s.health ? '' : 'none';
+  if (s.osrouter === '1') {
+    const ok = s.main_default === 'ok';
+    setText('v-main', ok ? 'OK — control plane can reach the internet' : 'MISSING — control plane will fail', ok ? '' : 'bad');
+  } else {
+    setText('v-main', 'n/a (standalone routing)');
+  }
 
-  if (!silent) toast('status refreshed');
+  const ex = s.exempt_prerouting === 'OK' && s.exempt_output === 'OK';
+  setText('v-exempt', `${s.exempt_prerouting || '?'} / ${s.exempt_output || '?'} / ${s.exempt_nat || '?'} (in/out/nat)`,
+    ex ? '' : 'warn');
+
+  const problems = [];
+  if (!running) problems.push('tailscaled is not running — press Start, then check the Log tab.');
+  if (running && mainBad) problems.push('The main routing table has no default route, so the control plane cannot connect. Press Restart; if it persists, send me the Log.');
+  if (running && backend && backend !== 'Running' && backend !== 'NeedsLogin') problems.push(`Backend state is "${backend}".`);
+  if (running && backend === 'NeedsLogin') problems.push('Not logged in yet — press Login.');
+  if (running && s.health) problems.push(s.health);
+  const h = $('health');
+  h.textContent = problems.join(' ');
+  h.style.display = problems.length ? '' : 'none';
+
+  if (announce) toast('status refreshed');
 }
 
 /* ---------------------------------------------------------------- actions --- */
@@ -89,7 +104,7 @@ async function action(name) {
   setBusy(true);
   try {
     await run(`${SVC} ${name}`);
-    await new Promise((r) => setTimeout(r, 1200));
+    await new Promise((r) => setTimeout(r, 1500));
     await refreshStatus();
     toast(`service ${name} done`);
   } finally {
@@ -106,17 +121,17 @@ async function login() {
   setBusy(true);
   try {
     toast('requesting a login link…');
-    const res = await run(`tailscale up --timeout=8s`, { quiet: true });
+    const res = await run('tailscale up --timeout=8s', { quiet: true });
     const url = extractUrl(`${res.stdout}\n${res.stderr}`);
     if (url) {
       $('login-url').href = url;
       $('login-url').textContent = url;
       $('login-box').style.display = '';
-      toast('login link ready - tap it');
+      toast('login link ready — tap it');
     } else if (/already logged in|Logged in/i.test(res.stdout)) {
       toast('already logged in');
     } else {
-      const tail = (res.stdout || res.stderr || '').trim().split('\n').slice(-3).join(' ');
+      const tail = (res.stdout || res.stderr || '').trim().split('\n').slice(-2).join(' ');
       toast(tail.slice(0, 160) || 'no login link returned', 'error');
     }
     await refreshStatus();
@@ -125,75 +140,7 @@ async function login() {
   }
 }
 
-/* ----------------------------------------------------------------- routes --- */
-async function loadRoutes() {
-  const res = await run(`cat ${ROUTES_FILE}`, { quiet: true });
-  $('routes').value = res.errno === 0 ? res.stdout : '';
-}
-
-function validateRoutes(text) {
-  if (text.includes('ROUTES_EOF')) return 'the text must not contain the line ROUTES_EOF';
-  const bad = text.split('\n').find((l) => l.trim() && !/^[0-9a-fA-F:.\/\s#]+$/.test(l));
-  return bad ? `invalid line: ${bad.trim()}` : '';
-}
-
-async function saveRoutes() {
-  const text = $('routes').value;
-  const err = validateRoutes(text);
-  if (err) { toast(err, 'error'); return; }
-  if (!text.trim()) { toast('refusing to write an empty file', 'error'); return; }
-
-  setBusy(true);
-  try {
-    const cmd = `cat > ${ROUTES_FILE} <<'ROUTES_EOF'\n${text}\nROUTES_EOF\n${SVC} routes-reload`;
-    const res = await run(cmd, { quiet: true });
-    if (res.errno === 0) {
-      toast('routes saved and applied');
-      await refreshStatus();
-    } else {
-      toast((res.stderr || 'save failed').trim().slice(0, 160), 'error');
-    }
-  } finally {
-    setBusy(false);
-  }
-}
-
-async function resetRoutes() {
-  $('routes').value = '# Tailscale address range. Do not remove.\n100.64.0.0/10\n\n'
-    + '# Advertised subnet routes, one per line, e.g.:\n# 192.168.100.0/24\n';
-  toast('default content loaded - press Save to apply');
-}
-
-/* -------------------------------------------------------------------- logs --- */
-async function loadLog() {
-  const res = await run(`tail -n 300 ${DAEMON_LOG} 2>/dev/null || echo "(no daemon log yet)"`, { quiet: true });
-  const el = $('log');
-  const stick = el.scrollTop + el.clientHeight >= el.scrollHeight - 40;
-  el.textContent = res.stdout || '(empty)';
-  if (stick) el.scrollTop = el.scrollHeight;
-}
-
-async function loadDiag() {
-  const res = await run(`${SVC} diag`, { quiet: true });
-  $('diag').textContent = res.stdout || res.stderr || '(no output)';
-}
-
-async function clearLogs() {
-  await run(`: > ${DAEMON_LOG}; : > ${DIAG_LOG}`, { quiet: true });
-  await loadLog();
-  await loadDiag();
-  toast('logs cleared');
-}
-
-function toggleAutoLog() {
-  state.autoLog = !state.autoLog;
-  $('auto').textContent = state.autoLog ? 'auto: on' : 'auto: off';
-  $('auto').classList.toggle('on', state.autoLog);
-  clearInterval(state.logTimer);
-  if (state.autoLog) state.logTimer = setInterval(loadLog, 3000);
-}
-
-/* ---------------------------------------------------------------- features --- */
+/* --------------------------------------------------------------- settings --- */
 const SWITCHES = {
   'sw-accept-routes': 'accept-routes',
   'sw-accept-dns': 'accept-dns',
@@ -202,41 +149,28 @@ const SWITCHES = {
 };
 
 function setSwitch(id, on) {
-  const el = $(id);
-  el.checked = on;
-  el.closest('.switch-row').classList.toggle('on', on);
-}
-
-function discoveredList() {
-  return ((state.prefs || {}).discovered || '').split(',').filter(Boolean);
-}
-
-function renderDiscovered() {
-  const list = discoveredList();
-  $('discovered').textContent = list.length ? list.join('\n') : '(none discovered yet)';
+  $(id).checked = on;
+  $(id).closest('.switch-row').classList.toggle('on', on);
 }
 
 async function loadPrefs() {
   const res = await run(`${SVC} prefs`, { quiet: true });
-  if (!res.stdout) { $('discovered').textContent = 'tailscaled is not running'; return; }
+  if (!res.stdout || /prefs_ok=0/.test(res.stdout)) return;
   const p = parseKv(res.stdout);
-  state.prefs = p;
   setSwitch('sw-accept-routes', p.accept_routes === '1');
   setSwitch('sw-accept-dns', p.accept_dns === '1');
   setSwitch('sw-shields-up', p.shields_up === '1');
   setSwitch('sw-advertise-exit-node', (p.advertise_routes || '').indexOf('0.0.0.0/0') >= 0);
   if (document.activeElement !== $('in-hostname')) $('in-hostname').value = p.hostname || '';
-  renderDiscovered();
 }
 
 async function togglePref(id) {
   const key = SWITCHES[id];
-  const el = $(id);
-  const want = el.checked;
-  el.disabled = true;
+  const want = $(id).checked;
+  $(id).disabled = true;
   const res = await run(`${SVC} set-pref ${key} ${want ? 'on' : 'off'}`, { quiet: true });
   if (res.errno === 0) {
-    toast(`${key} ${want ? 'enabled' : 'disabled'}`);
+    toast(`${key} ${want ? 'on' : 'off'}`);
     await loadPrefs();
     await refreshStatus();
   } else {
@@ -244,7 +178,7 @@ async function togglePref(id) {
     toast((msg || `${key} failed`).slice(0, 150), 'error');
     setSwitch(id, !want);
   }
-  el.disabled = false;
+  $(id).disabled = false;
 }
 
 async function setHostname() {
@@ -255,43 +189,8 @@ async function setHostname() {
   await loadPrefs();
 }
 
-async function setAdvertiseRoutes() {
-  const v = $('in-advertise').value.trim();
-  if (v && !/^[0-9a-fA-F:.,/]+$/.test(v)) { toast('invalid CIDR list', 'error'); return; }
-  const res = await run(`${SVC} set-pref advertise-routes ${v}`, { quiet: true });
-  toast(res.errno === 0 ? 'advertised routes updated' : 'could not update', res.errno === 0 ? 'info' : 'error');
-  await loadPrefs();
-}
-
-/* Discover the subnet routes the tailnet offers and install them.
-   Exit code 2 means --accept-routes is off, so there was nothing to see: turn it
-   on and retry automatically rather than making the user guess. */
-async function discover() {
-  setBusy(true);
-  try {
-    let res = await run(`${SVC} routes-sync`, { quiet: true });
-    if (res.errno === 2) {
-      toast('accept-routes was off - enabling it and retrying…');
-      await run(`${SVC} set-pref accept-routes on`, { quiet: true });
-      await new Promise((r) => setTimeout(r, 2000));
-      res = await run(`${SVC} routes-sync`, { quiet: true });
-    }
-    await loadPrefs();
-    await loadRoutes();
-    await refreshStatus();
-    if (res.errno === 0) {
-      const n = discoveredList().length;
-      toast(n ? `discovered ${n} subnet route(s)` : 'no subnet routes visible yet (approved in the admin console?)');
-    } else {
-      toast((res.stderr || 'discovery failed').trim().split('\n').pop().slice(0, 150), 'error');
-    }
-  } finally {
-    setBusy(false);
-  }
-}
-
-/* Two-tap arming instead of confirm(): some manager WebViews do not implement
-   window.confirm and would silently return false. */
+/* Two-tap arming instead of window.confirm: some manager WebViews do not
+   implement confirm() and would silently return false. */
 function armButton(el, label, handler) {
   let armed = false;
   let timer = null;
@@ -317,64 +216,86 @@ async function logout() {
   try {
     await run(`${SVC} logout`);
     await refreshStatus();
-    await loadPrefs();
-    toast('logged out - tap Login to authorise again');
+    toast('logged out — press Login to authorise again');
   } finally {
     setBusy(false);
   }
 }
 
+/* -------------------------------------------------------------------- log --- */
+async function loadOutput() {
+  const res = state.source === 'daemon'
+    ? await run(`tail -n 250 ${DAEMON_LOG} 2>/dev/null || echo "(no daemon log yet)"`, { quiet: true })
+    : await run(`${SVC} diag`, { quiet: true });
+  const el = $('out');
+  const stick = el.scrollTop + el.clientHeight >= el.scrollHeight - 40;
+  el.textContent = res.stdout || res.stderr || '(empty)';
+  if (stick) el.scrollTop = el.scrollHeight;
+}
+
+function setSource(which) {
+  state.source = which;
+  $('btn-src-daemon').classList.toggle('on', which === 'daemon');
+  $('btn-src-diag').classList.toggle('on', which === 'diag');
+  $('src-label').textContent = which === 'daemon' ? 'Daemon log' : 'Diagnostics';
+  loadOutput();
+}
+
+function toggleAuto() {
+  state.auto = !state.auto;
+  $('auto').textContent = state.auto ? 'auto: on' : 'auto: off';
+  $('auto').classList.toggle('on', state.auto);
+  clearInterval(state.timer);
+  if (state.auto) state.timer = setInterval(loadOutput, 5000);
+}
+
+async function clearLogs() {
+  await run(`: > ${DAEMON_LOG}; : > ${DIAG_LOG}`, { quiet: true });
+  await loadOutput();
+  toast('logs cleared');
+}
+
 /* -------------------------------------------------------------------- tabs --- */
 function showTab(name) {
-  ['status', 'routes', 'features', 'log', 'diag'].forEach((t) => {
+  ['status', 'settings', 'log'].forEach((t) => {
     $(`tab-${t}`).classList.toggle('active', t === name);
     $(`panel-${t}`).style.display = t === name ? '' : 'none';
   });
-  if (name === 'log') loadLog();
-  if (name === 'diag') loadDiag();
-  if (name === 'routes') { loadRoutes(); renderDiscovered(); }
-  if (name === 'features') loadPrefs();
+  if (name === 'log') loadOutput();
+  if (name === 'settings') loadPrefs();
 }
 
 /* -------------------------------------------------------------------- init --- */
 function wire() {
-  $('refresh').onclick = async () => { await refreshStatus({ silent: false }); };
+  $('refresh').onclick = () => refreshStatus({ announce: true });
   document.querySelectorAll('button[data-action]').forEach((b) => {
     b.onclick = () => action(b.dataset.action);
   });
   $('btn-login').onclick = login;
   armButton($('btn-logout'), 'tap again to log out', logout);
 
-  $('btn-save').onclick = saveRoutes;
-  $('btn-reset').onclick = resetRoutes;
-  $('btn-discover').onclick = discover;
-
   $('btn-prefs-refresh').onclick = async () => { await loadPrefs(); toast('features refreshed'); };
   Object.keys(SWITCHES).forEach((id) => { $(id).onchange = () => togglePref(id); });
   $('btn-hostname').onclick = setHostname;
-  $('btn-advertise').onclick = setAdvertiseRoutes;
 
-  $('btn-log-refresh').onclick = loadLog;
-  $('btn-diag-refresh').onclick = loadDiag;
+  $('btn-src-daemon').onclick = () => setSource('daemon');
+  $('btn-src-diag').onclick = () => setSource('diag');
+  $('btn-log-refresh').onclick = loadOutput;
   $('btn-clear').onclick = clearLogs;
-  $('auto').onclick = toggleAutoLog;
+  $('auto').onclick = toggleAuto;
 
   $('tab-status').onclick = () => showTab('status');
-  $('tab-routes').onclick = () => showTab('routes');
-  $('tab-features').onclick = () => showTab('features');
+  $('tab-settings').onclick = () => showTab('settings');
   $('tab-log').onclick = () => showTab('log');
-  $('tab-diag').onclick = () => showTab('diag');
 }
 
 wire();
 showTab('status');
-refreshStatus({ silent: true });
-loadPrefs();
+refreshStatus();
 
-let tick = 0;
+// 15 s, not 5: each poll spawns a root shell and asks tailscaled for its status,
+// which is not free on a phone.
 setInterval(() => {
   if (state.busy || document.visibilityState !== 'visible') return;
   refreshStatus();
-  tick += 1;
-  if (tick % 4 === 0 && $('panel-features').style.display !== 'none') loadPrefs();
-}, 5000);
+}, 15000);

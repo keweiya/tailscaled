@@ -1,52 +1,58 @@
 # Tailscale for Android (KernelSU / Magisk module)
 
-A self-contained module that runs a **`GOOS=android`** `tailscaled` on a rooted
-Android device, with the routing it needs, and lets browsers and apps reach the
-tailnet and advertised subnets.
+A self-contained module that runs `tailscaled` on a rooted Android device and
+lets browsers and apps reach the tailnet and a peer's advertised subnets.
+
+It is built **`GOOS=linux`** on purpose — see below — and carries the three fixes
+that make a linux build survive Android.
 
 Forked from [mgksu/tailscaled](https://github.com/mgksu/tailscaled) (itself a
 fork of [anasfanani/Magisk-Tailscaled](https://github.com/anasfanani/Magisk-Tailscaled)).
 
 ---
 
-## Why `GOOS=android` is the whole point
+## Why `GOOS=linux`, not `GOOS=android`
 
-Tailscale's kernel routing lives in `wgengine/router/osrouter`, and that package
-is compiled out on Android:
+The obvious build for a phone is `GOOS=android`, and it is what most modules try.
+It **cannot work for a standalone daemon**. `wgengine/router` gets its
+implementation from `router.HookNewUserspaceRouter`, and that hook is only ever
+registered by `osrouter`'s platform files — while `osrouter/router_linux.go`
+carries `//go:build !android`. Build for android and the hook stays empty, so:
 
-```go
-// wgengine/router/osrouter/router_linux.go
-//go:build !android
+```
+wgengine.NewUserspaceEngine(tun "tailscale0") error: creating router: unsupported OS "android"
+getLocalBackend error: createEngine: creating router: unsupported OS "android"
 ```
 
-So a `GOOS=android` `tailscaled`:
+tailscaled exits immediately. (The official Android app only avoids this because
+it ships its own Java `VpnService` router and registers it on that hook.
+`--tun=userspace-networking` also starts, but then nothing is routed at the
+kernel level, so no browser or app could ever reach `192.168.100.1`.)
 
-* installs **no** `ip rule`s and **no** routes,
-* installs **no** `ts-input` / `ts-forward` / `ts-postrouting` iptables chains,
-* never sets `SO_MARK` (`netns.UseSocketMark()` returns `false`).
+So this module builds `GOOS=linux` and makes the linux build survive Android.
 
-The official Android app supplies routing through Java `VpnService`. A standalone
-daemon has to supply it itself — that is what this module does, with the smallest
-possible footprint.
+### The one thing that breaks, and the fix
 
-### The failure this avoids
+With `GOOS=linux`, osrouter is active and tags tailscaled's own sockets with the
+**bypass mark**, routing them with `ip rule ... lookup main`. **Android's `main`
+table has no default route** — netd keeps its default in per-network tables such
+as `rmnet_data3` — so the daemon's own traffic to the control plane and DERP dies
+with `network is unreachable` and the node never comes up.
 
-The **official linux build** (what `pkgs.tailscale.com` ships, and what
-`tailscale update` downloads) does the opposite. It tags its own sockets with
-`fwmark 0x80000` and routes them through `lookup main`, and it installs iptables
-chains. On Android the `main` routing table has no default route
-(Android keeps its default route in per-network tables such as `rmnet_data3`),
-so the control plane dies with `network is unreachable` and the node stays
-`logged out`.
+The module therefore keeps a default route in `main` (plus a connected route for
+the source subnet) and re-asserts it whenever netd rewrites the tables.
 
-**Consequence: never run `tailscale update`.** It replaces the module's binary
-with the linux one and blocks the link. This module defends against that twice:
+Two kernel-level collisions are handled too:
 
-1. `system/bin/tailscale` refuses the `update` subcommand.
-2. On every start the service compares the binary against a stored checksum and
-   restores the known-good copy if it was replaced.
+| Problem | Fix |
+|---|---|
+| Stock marks `0x40000` / `0x80000` collide with the **"permission" bits (18–19)** of Android's `netd` fwmark layout, misrouting the control plane | build patch moves them to reserved bits: `0x8000000` and `0x10020000` (`linuxfw-mark.patch`) |
+| A TPROXY proxy (Surfing/Clash) jumps `DIVERT` at mangle `PREROUTING` rule 1 and hijacks the tunnel's TCP replies — ping works, the browser hangs | the module keeps `-i tailscale0 -j RETURN` at rule 1 of `PREROUTING`, `OUTPUT` and nat `OUTPUT`, re-asserted every 15 s |
 
----
+Everything else is osrouter's job, and it does it well: it installs its rules at
+preference 5210–5270 (ahead of netd's 11000) and puts the tailnet prefixes — plus
+**any subnet route you accept** — into table 52. So there is no route management
+to do by hand.
 
 ## Install
 
@@ -82,8 +88,7 @@ replaces; the **state directory** holds everything that must survive an update.
 
 /data/adb/tailscale/                     state dir (KEPT across module updates)
 ├── settings.ini         <-- paths, TUN name, table id, rule priority
-├── routes               <-- WHICH PREFIXES GO INTO THE TUNNEL  (yours to edit)
-├── routes.auto          subnet routes discovered from the tailnet (regenerated)
+├── routes               optional manual prefixes (osrouter handles the normal case)
 ├── bin/
 │   ├── tailscale        combined binary (CLI)
 │   ├── tailscaled       combined binary (daemon)
@@ -116,16 +121,14 @@ survive module updates. Deleting them restores the defaults.
 
 ## WebUI
 
-The module ships a KernelSU / APatch WebUI (open it from the module card in the
-manager). Four tabs:
+The module ships a KernelSU / APatch WebUI: open it from the module card in the
+manager. Three tabs, deliberately few controls:
 
 | Tab | What it does |
 |---|---|
-| **Status** | live state dot, tailnet address, `BackendState`, routed prefixes, whether the binary still matches the known-good copy, and the three proxy-exemption verdicts. Start / Stop / Restart, plus **Login**, which fetches a `login.tailscale.com` link and shows it as a tappable URL. |
-| **Routes** | edit `/data/adb/tailscale/routes` in place and press *Save & apply* — the service drops the old rules and installs the new ones immediately, no restart needed. Below it, **Discover** fetches the subnet routes the tailnet offers, writes `routes.auto` and installs them (if *Accept subnet routes* is off it turns it on and retries). |
-| **Features** | switches for **Accept subnet routes**, **Accept DNS**, **Shields up** and **Advertise as an exit node**; a field for the device **hostname** and one for **advertised routes**; plus what this build cannot do (exit node, SSH, self-update) and **Log out**. |
-| **Log** | the daemon log, with an auto-refresh toggle and a clear button. |
-| **Diagnostics** | the same dump as `tailscaled.service diag`. |
+| **Status** | state dot, tailnet address, `BackendState`, account, and three health checks (**binary**, **default route**, **proxy exemption**). Start / Stop / Restart, plus **Login**, which fetches a `login.tailscale.com` link and shows it as a tappable URL. Refreshes every 15 s. |
+| **Settings** | switches for **Accept subnet routes**, **Accept DNS**, **Shields up** and **Advertise as an exit node**; a device **hostname** field; what this build cannot do (using an exit node, SSH, self-update) and **Log out**. |
+| **Log** | one pane, toggling between the daemon log and the full diagnostic dump, with an auto-refresh switch and a clear button. |
 
 The WebUI only calls the service script, so anything it does you can also do over
 `adb shell` / a terminal with the commands below. If the status dot is red and
@@ -163,58 +166,32 @@ jump is present, and the tail of the logs. **Start there when something is off.*
 
 ---
 
-## Reaching advertised subnets
+## Reaching a peer's advertised subnet
 
-A `GOOS=android` daemon has no `osrouter`, so `--accept-routes` cannot install
-kernel routes: the module installs them instead. Two files feed the routing and
-`route_prefixes()` merges them:
-
-| File | Managed by | Purpose |
-|---|---|---|
-| `/data/adb/tailscale/routes` | **you** | hand-written prefixes. Never rewritten by the module. |
-| `/data/adb/tailscale/routes.auto` | the module | subnet routes discovered from the tailnet. Regenerated on every sync. |
-
-### Automatic (recommended)
-
-Open the WebUI → **Routes** → *Discover*, or run:
+Nothing to configure by hand. osrouter installs accepted subnet routes into
+table 52 for you, so it is two steps:
 
 ```sh
-su -c 'tailscale set --accept-routes'      # once, so the netmap carries the routes
-su -c 'tailscaled.service routes-sync'
+su -c 'tailscale set --accept-routes'
 ```
 
-The module reads the subnet routes the control plane says are reachable
-(`Peer.PrimaryRoutes` in `tailscale status --json`), writes them to
-`routes.auto`, and installs `ip route … table 1099` plus
-`ip rule to <prefix> lookup 1099` for each one. It also re-syncs on every service
-start and every 60 s from the watchdog, so routes that appear (or disappear)
-later are picked up without you touching anything.
+and the peer's route must be approved in the admin console. Then
+`http://192.168.100.1` works in any browser.
 
-### Manual
+The WebUI does the same thing: **Settings → Accept subnet routes**.
 
-Add prefixes to `/data/adb/tailscale/routes`, one per line:
+Check it with `tailscaled.service routes`, which prints table 52:
 
 ```
-100.64.0.0/10
-192.168.100.0/24
+mode:                    osrouter (linux build) - tailscaled owns the routing
+default route in main:   default via 10.20.30.1 dev rmnet_data3
+tailnet in table 52:
+  100.64.0.0/10 dev tailscale0
+  192.168.100.0/24 dev tailscale0
 ```
 
-then `su -c 'tailscaled.service restart'`.
-
-Either way the route must be advertised by a peer
-(`tailscale up --advertise-routes=192.168.100.0/24`) **and approved in the admin
-console**, and `--accept-routes` must be on — that flag makes `tailscaled`
-*accept* the routes into its netmap; the route files make the *kernel* send those
-destinations into the tunnel. Both are required.
-
-Under the hood the whole mechanism is just:
-
-```sh
-ip route replace <prefix> dev tailscale0 table 1099
-ip rule  add to <prefix> lookup 1099 pref 12000     # selection is BY DESTINATION
-```
-
-Nothing else on the device is touched, so a proxy's rules are never disturbed.
+`/data/adb/tailscale/routes` still exists as a manual fallback if you ever need
+to force a prefix into the tunnel, but you should not need it.
 
 ## Coexisting with a proxy (Surfing / Clash / Mihomo / anything)
 
@@ -261,14 +238,13 @@ required, and it does not fix the inbound direction.
 ## Notes and limitations
 
 * **arm64 only.**
-* **No Tailscale SSH** — built with `ts_omit_ssh` (`feature/ssh` excludes
-  android while `cmd/tailscaled/ssh.go` does not, so it cannot be linked).
-* **No exit node** support. There is no `SO_MARK`/socket-protect on Android, so
-  routing *all* traffic into the tunnel would loop the daemon's own packets.
-  Only the listed prefixes are routed, so there is no loop — but an exit node
-  will not work either.
-* **No UPX.** The binary is shipped uncompressed; UPX requires executable
-  anonymous mappings, which some ROMs/SELinux policies refuse.
+* **No Tailscale SSH** — built with `ts_omit_ssh`.
+* **Using an exit node is not supported** (advertising this device as one is
+  fine): that needs the daemon's own sockets kept out of the tunnel, which needs
+  `SO_MARK`/`VpnService.protect`, and neither is available to a standalone
+  daemon.
+* **No UPX.** The binary is shipped uncompressed; UPX needs executable anonymous
+  mappings, which some ROMs/SELinux policies refuse.
 
 ---
 
@@ -294,16 +270,11 @@ survive module updates.
 ## Building
 
 Pushing a tag / running the **Build tailscale for Android** workflow compiles
-`tailscale/tailscale` for `GOOS=android GOARCH=arm64` with:
-
-```
-ts_include_cli,ts_omit_ssh,ts_omit_systray,ts_omit_syslog,ts_omit_dbus,ts_omit_resolved,ts_omit_networkmanager
-```
-
-and one source patch: the resolver path becomes `/data/adb/tailscale/resolv.conf`
-(Android has no usable `/etc/resolv.conf`). The workflow verifies the resulting
-binary contains no `osrouter` code before packaging, and publishes a release plus
-an updated `update.json`.
+`tailscale/tailscale` for `GOOS=linux GOARCH=arm64` with tags
+`ts_include_cli,ts_omit_ssh`, and applies `linuxfw-mark.patch` (the fwmark move
+described above). The workflow asserts that `osrouter` **is** linked in and that
+`0x1e020000` is present before packaging, so a silently wrong build cannot be
+released. It then publishes a release plus an updated `update.json`.
 
 ---
 

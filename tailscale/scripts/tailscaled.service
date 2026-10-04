@@ -129,8 +129,107 @@ wait_tun() {
   return 1
 }
 
+# --------------------------------------------- control-plane routing (linux) --
+# This build is GOOS=linux, so osrouter is active: tailscaled tags its own
+# sockets with the bypass mark (patched to 0x10020000 so it does not collide with
+# Android's netd fwmark layout) and routes them with `ip rule ... lookup main`.
+# Android's main table has no default route - netd keeps the default in
+# per-network tables such as rmnet_data3 - so the daemon's own traffic dies with
+# "network is unreachable" and the node never comes up. Put a default in main and
+# keep it there; netd rewrites the tables on every network transition.
+#
+# Note the destination routing itself is osrouter's job: it installs its rules at
+# preference 5210-5270 (ahead of netd's 11000) and puts the tailnet prefixes plus
+# any accepted subnet routes into table 52. Nothing here needs to duplicate that.
+
+detect_default_route() {
+  _probe=$(ip route get 8.8.8.8 2>/dev/null | head -n1)
+  case "$_probe" in
+    *unreachable*|"") _probe=$(ip route get 1.1.1.1 2>/dev/null | head -n1) ;;
+  esac
+  printf '%s %s %s' \
+    "$(printf '%s' "$_probe" | sed -n 's/.* via \([0-9a-fA-F:.]*\).*/\1/p')" \
+    "$(printf '%s' "$_probe" | sed -n 's/.* dev \([^ ]*\).*/\1/p')" \
+    "$(printf '%s' "$_probe" | sed -n 's/.* src \([0-9a-fA-F:.]*\).*/\1/p')"
+}
+
+apply_main_default() {
+  _gw=$(printf '%s' "$1" | awk '{print $1}')
+  _dev=$(printf '%s' "$1" | awk '{print $2}')
+  [ -n "${_dev}" ] || return 1
+  if [ -n "${_gw}" ]; then
+    ip route replace default via "${_gw}" dev "${_dev}" table main 2>/dev/null || return 1
+    printf 'via %s dev %s' "${_gw}" "${_dev}"
+  else
+    ip route replace default dev "${_dev}" table main 2>/dev/null || return 1
+    printf 'dev %s' "${_dev}"
+  fi
+}
+
+main_route_matches() {
+  _gw=$(printf '%s' "$1" | awk '{print $1}')
+  _dev=$(printf '%s' "$1" | awk '{print $2}')
+  [ -n "${_dev}" ] || return 1
+  if [ -n "${_gw}" ]; then
+    ip route show table main 2>/dev/null | grep -q "^default via ${_gw} dev ${_dev}"
+  else
+    ip route show table main 2>/dev/null | grep -q "^default dev ${_dev}"
+  fi
+}
+
+# Is this a linux build with osrouter running? It installs a rule into table 52.
+osrouter_active() {
+  ip rule show 2>/dev/null | grep -q 'lookup 52$'
+}
+
+# Re-add the bypass-mark rules if something dropped them (only meaningful when
+# osrouter is active; harmless otherwise).
+ensure_bypass_rules() {
+  ip rule show 2>/dev/null | grep -q 'fwmark 0x10020000/0x1e020000 lookup main' \
+    || ip rule add fwmark 0x10020000/0x1e020000 lookup main pref 5210 2>/dev/null
+  ip rule show 2>/dev/null | grep -q 'fwmark 0x10020000/0x1e020000 unreachable' \
+    || ip rule add fwmark 0x10020000/0x1e020000 unreachable pref 5250 2>/dev/null
+  return 0
+}
+
+fix_controlplane_routing() {
+  _info=$(detect_default_route)
+  _dev=$(printf '%s' "${_info}" | awk '{print $2}')
+  if [ -z "${_dev}" ]; then
+    diag "main-default: no default route detected yet (offline?)"
+    return 1
+  fi
+  if main_route_matches "${_info}"; then
+    diag "main-default: already correct (gw=$(printf '%s' "${_info}" | awk '{print $1}') dev=${_dev})"
+  else
+    _applied=$(apply_main_default "${_info}")
+    if [ -n "${_applied}" ]; then
+      diag "main-default: set to ${_applied}  (control plane needs this)"
+    else
+      diag "main-default: FAILED to set a default route in table main"
+      return 1
+    fi
+  fi
+  # Connected route for the source subnet, so tailscaled can resolve/bind to its
+  # own source address through main.
+  _src=$(printf '%s' "${_info}" | awk '{print $3}')
+  if [ -n "${_src}" ]; then
+    _net=$(printf '%s' "${_src}" | sed -n 's/^\([0-9]*\.[0-9]*\.[0-9]*\)\..*/\1.0/p')
+    [ -n "${_net}" ] && ip route replace "${_net}/24" dev "${_dev}" table main 2>/dev/null
+  fi
+  ensure_bypass_rules
+  return 0
+}
+
 routes_ok() {
   ip link show "${tun_iface}" >/dev/null 2>&1 || return 1
+  if osrouter_active; then
+    # tailscaled owns the destination routing (table 52). The only thing that
+    # needs maintaining is a usable default route in `main` for its
+    # bypass-marked sockets.
+    main_route_matches "$(detect_default_route)" || return 1
+    return 0
+  fi
   _prefixes=$(route_prefixes)
   [ -n "${_prefixes}" ] || return 1
   for _pfx in ${_prefixes}; do
@@ -176,21 +275,29 @@ _exempt_one() {
 
 add_routes() {
   wait_tun || return 1
-  for _pfx in $(route_prefixes); do
-    if ip route replace "${_pfx}" dev "${tun_iface}" table "${tun_table}" 2>/dev/null; then
-      diag "routes: table ${tun_table}: ${_pfx} dev ${tun_iface}"
-    else
-      diag "routes: WARN could not add ${_pfx} to table ${tun_table}"
-    fi
-    ip route replace "${_pfx}" dev "${tun_iface}" metric 1 2>/dev/null
-    if ip rule show 2>/dev/null | grep -q "to ${_pfx} lookup ${tun_table}"; then
-      diag "routes: rule to ${_pfx} already present"
-    elif ip rule add to "${_pfx}" lookup "${tun_table}" pref "${tun_rule_pref}" 2>/dev/null; then
-      diag "routes: rule to ${_pfx} lookup ${tun_table} pref ${tun_rule_pref}"
-    else
-      diag "routes: WARN could not add rule for ${_pfx}"
-    fi
-  done
+  if osrouter_active; then
+    # Normal case for this build: osrouter puts the tailnet prefixes and any
+    # accepted subnet routes into table 52 by itself, at a rule preference ahead
+    # of netd's. Do not duplicate it.
+    diag "routes: osrouter active (table 52) - tailscaled installs the routes itself"
+  else
+    for _pfx in $(route_prefixes); do
+      if ip route replace "${_pfx}" dev "${tun_iface}" table "${tun_table}" 2>/dev/null; then
+        diag "routes: table ${tun_table}: ${_pfx} dev ${tun_iface}"
+      else
+        diag "routes: WARN could not add ${_pfx} to table ${tun_table}"
+      fi
+      ip route replace "${_pfx}" dev "${tun_iface}" metric 1 2>/dev/null
+      if ip rule show 2>/dev/null | grep -q "to ${_pfx} lookup ${tun_table}"; then
+        diag "routes: rule to ${_pfx} already present"
+      elif ip rule add to "${_pfx}" lookup "${tun_table}" pref "${tun_rule_pref}" 2>/dev/null; then
+        diag "routes: rule to ${_pfx} lookup ${tun_table} pref ${tun_rule_pref}"
+      else
+        diag "routes: WARN could not add rule for ${_pfx}"
+      fi
+    done
+  fi
+  fix_controlplane_routing
   exempt_tunnel
   return 0
 }
@@ -309,204 +416,28 @@ show_status() {
 }
 
 show_routes() {
-  echo "manual (routes):        $(grep -E '^[0-9a-fA-F:.]+/[0-9]+$' "${tailscale_routes_file}" 2>/dev/null | tr '\n' ' ')"
-  echo "discovered (routes.auto): $(grep -E '^[0-9a-fA-F:.]+/[0-9]+$' "${tailscale_routes_auto_file}" 2>/dev/null | tr '\n' ' ')"
-  echo "in use:                 $(route_prefixes | tr '\n' ' ')"
-  echo "tun device:             ${tun_iface} $([ -d /sys/class/net/${tun_iface} ] && echo '(up)' || echo '(down)')"
-  echo "table ${tun_table}:"
-  ip route show table "${tun_table}" 2>/dev/null | sed 's/^/  /'
-  echo "ip rules:"
-  ip rule show 2>/dev/null | grep "to .* lookup ${tun_table}" | sed 's/^/  /'
-}
-
-show_exemptions() {
-  for _spec in mangle:PREROUTING mangle:OUTPUT nat:OUTPUT; do
-    _t=${_spec%%:*}
-    _c=${_spec##*:}
-    if iptables -t "$_t" -L "$_c" -n >/dev/null 2>&1; then
-      _r=$(iptables -t "$_t" -L "$_c" -n -v --line-numbers 2>/dev/null | awk '$1 == 1 { print; exit }')
-      if echo "${_r}" | grep -q "${tun_iface}"; then
-        echo "  OK   ${_t}/${_c} rule 1: ${_r}"
-      else
-        echo "  BAD  ${_t}/${_c} rule 1: ${_r:-<empty>}   (tunnel traffic is NOT exempt)"
-      fi
+  if osrouter_active; then
+    echo "mode:                    osrouter (linux build) - tailscaled owns the routing"
+    if main_route_matches "$(detect_default_route)"; then
+      echo "default route in main:   $(ip route show table main 2>/dev/null | grep '^default' | head -n1)"
     else
-      echo "  --   ${_t}/${_c}: chain does not exist"
+      echo "default route in main:   NONE  <-- the control plane will fail"
     fi
-  done
-  if iptables -t mangle -L PREROUTING -n -v --line-numbers 2>/dev/null | grep -q DIVERT; then
-    echo "  note: a proxy DIVERT jump exists in mangle PREROUTING; the OK line above"
-    echo "        must come first or tailnet TCP (not ICMP) will be hijacked."
+    echo "tailnet in table 52:"
+    ip route show table 52 2>/dev/null | sed 's/^/  /'
+    echo "bypass rules:"
+    ip rule show 2>/dev/null | grep '0x10020000' | sed 's/^/  /'
+  else
+    echo "mode:                    standalone (no osrouter) - this module owns the routing"
+    echo "manual (routes):         $(grep -E '^[0-9a-fA-F:.]+/[0-9]+$' "${tailscale_routes_file}" 2>/dev/null | tr '\n' ' ')"
+    echo "discovered (routes.auto): $(grep -E '^[0-9a-fA-F:.]+/[0-9]+$' "${tailscale_routes_auto_file}" 2>/dev/null | tr '\n' ' ')"
+    echo "in use:                  $(route_prefixes | tr '\n' ' ')"
+    echo "table ${tun_table}:"
+    ip route show table "${tun_table}" 2>/dev/null | sed 's/^/  /'
+    echo "ip rules:"
+    ip rule show 2>/dev/null | grep "to .* lookup ${tun_table}" | sed 's/^/  /'
   fi
-}
-
-show_diag() {
-  echo "=== tailscaled diagnostic ==="
-  echo "time:          $(date +'%Y-%m-%d %H:%M:%S')"
-  echo "binary:        ${tailscaled_bin}"
-  echo "  present:     $([ -f "${tailscaled_bin}" ] && echo yes || echo NO)"
-  echo "  hash:        $(hash_file "${tailscaled_bin}")"
-  echo "  pristine:    $([ -f "${tailscaled_bin_pristine}" ] && echo yes || echo NO)  expected hash: $(cat "${tailscaled_bin_sum}" 2>/dev/null)"
-  echo "daemon pid:    $(daemon_pid)"
-  echo "socket:        $([ -S "${tailscale_dir}/run/tailscaled.sock" ] && echo present || echo absent)"
-  echo "watchdog pid:  $(cat "${tailscaled_run_dir}/watchdog.pid" 2>/dev/null)"
-  echo "routes file:   ${tailscale_routes_file} $([ -f "${tailscale_routes_file}" ] && echo '(present)' || echo '(missing - using default 100.64.0.0/10)')"
-  echo ""
-  show_routes
-  echo ""
-  echo "tunnel exemptions (rule 1 of each chain must RETURN tunnel traffic):"
-  show_exemptions
-  echo ""
-  echo "daemon log (last 10 lines):"
-  tail -n 10 "${tailscaled_log}" 2>/dev/null | sed 's/^/  /'
-  echo ""
-  echo "--- recent diagnostic log ---"
-  tail -n 40 "${tailscaled_diag_log}" 2>/dev/null
-}
-
-log_view() {
-  case "$1" in
-    runs)       tail -n 200 -F "${tailscaled_runs_log}" ;;
-    service)    tail -n 200 -F "${tailscaled_service_log}" ;;
-    tailscaled) tail -n 200 -F "${tailscaled_log}" ;;
-    diag)       tail -n 200 -F "${tailscaled_diag_log}" ;;
-    *)
-      [ -n "$1" ] && echo "${scripts_name} log $1 not found"
-      echo "usage: ${scripts_name} log {runs|service|tailscaled|diag}"
-      ;;
-  esac
-}
-
-# ------------------------------------------------------- subnet discovery ---
-# The control plane tells every node which subnet routes it can reach
-# (ipnstate.PeerStatus.PrimaryRoutes). Read them from `tailscale status --json`,
-# write them to routes.auto and install routing for them. Hand-written entries in
-# `routes` are kept and merged, never clobbered.
-#
-# PrimaryRoutes is only populated for routes we actually accepted, so
-# --accept-routes must be on first; otherwise there is nothing to discover.
-# Exit code 2 means exactly that, so the WebUI can offer to enable it.
-routes_sync() {
-  if [ -z "$(daemon_pid)" ] || [ ! -S "${tailscale_dir}/run/tailscaled.sock" ]; then
-    diag "routes-sync: daemon/socket not available"
-    return 1
-  fi
-
-  if ! "${tailscale_bin}" ${tailscale_bin_param} debug prefs 2>/dev/null | grep -q '"RouteAll": *true'; then
-    diag "routes-sync: --accept-routes is OFF, so the netmap carries no subnet routes"
-    return 2
-  fi
-
-  _json=$("${tailscale_bin}" ${tailscale_bin_param} status --json 2>/dev/null)
-  _found=$(printf '%s' "${_json}" | tr -d ' \n\t' \
-             | grep -o '"PrimaryRoutes":\[[^]]*\]' \
-             | grep -o '[0-9a-fA-F:.]\+/[0-9]\+' | sort -u)
-  _old=$(grep -E '^[0-9a-fA-F:.]+/[0-9]+$' "${tailscale_routes_auto_file}" 2>/dev/null | sort -u)
-
-  if [ "${_found}" = "${_old}" ]; then
-    diag "routes-sync: unchanged ($(printf '%s' "${_found}" | tr '\n' ' '))"
-    return 0
-  fi
-
-  {
-    echo "# Written by 'tailscaled.service routes-sync'. Regenerated automatically,"
-    echo "# so local edits here are lost - put your own entries in 'routes' instead."
-    echo "# Updated: $(date +'%Y-%m-%d %H:%M:%S')"
-    if [ -n "${_found}" ]; then
-      printf '%s\n' "${_found}"
-    else
-      echo "# no subnet routes visible yet - is --accept-routes on and the route"
-      echo "# approved in the admin console?"
-    fi
-  } > "${tailscale_routes_auto_file}" 2>/dev/null
-
-  diag "routes-sync: discovered [$(printf '%s' "${_found}" | tr '\n' ' ')]"
-  routes_reload
-  return 0
-}
-
-# ------------------------------------------------------------ preferences ---
-_jbool() {
-  _v=$(printf '%s' "$1" | grep -o "\"$2\": *[a-z]*" | head -n1 | sed 's/.*: *//')
-  case "${_v}" in true) echo 1 ;; *) echo 0 ;; esac
-}
-
-_jstr() {
-  printf '%s' "$1" | grep -o "\"$2\": *\"[^\"]*\"" | head -n1 | sed 's/.*"\([^"]*\)"$/\1/'
-}
-
-# Machine-readable Tailscale preferences for the WebUI.
-show_prefs() {
-  _p=$("${tailscale_bin}" ${tailscale_bin_param} debug prefs 2>/dev/null)
-  if [ -z "${_p}" ]; then
-    echo "prefs_ok=0"
-    return 1
-  fi
-  echo "prefs_ok=1"
-  echo "accept_routes=$(_jbool "${_p}" RouteAll)"
-  echo "accept_dns=$(_jbool "${_p}" CorpDNS)"
-  echo "shields_up=$(_jbool "${_p}" ShieldsUp)"
-  echo "want_running=$(_jbool "${_p}" WantRunning)"
-  echo "logged_out=$(_jbool "${_p}" LoggedOut)"
-  echo "hostname=$(_jstr "${_p}" Hostname)"
-  echo "exit_node=$(_jstr "${_p}" ExitNodeID)"
-  echo "advertise_routes=$(printf '%s' "${_p}" | tr -d ' \n' \
-        | grep -o '"AdvertiseRoutes":\[[^]]*\]' | grep -o '[0-9a-fA-F:.]\+/[0-9]\+' | tr '\n' ',')"
-  echo "discovered=$(grep -E '^[0-9a-fA-F:.]+/[0-9]+$' "${tailscale_routes_auto_file}" 2>/dev/null | tr '\n' ',')"
-}
-
-# Whitelisted preference changes. The value is always passed as a single
-# argument, and only known keys are accepted, so the WebUI cannot inject flags.
-set_pref() {
-  _k=$1
-  _v=$2
-  case "$_k" in
-    accept-routes)      _flag="--accept-routes=$(_onoff "${_v}")" ;;
-    accept-dns)         _flag="--accept-dns=$(_onoff "${_v}")" ;;
-    shields-up)         _flag="--shields-up=$(_onoff "${_v}")" ;;
-    exit-node-allow-lan) _flag="--exit-node-allow-lan-access=$(_onoff "${_v}")" ;;
-    advertise-exit-node) _flag="--advertise-exit-node=$(_onoff "${_v}")" ;;
-    auto-update)        _flag="--auto-update=$(_onoff "${_v}")" ;;
-    hostname)
-      case "${_v}" in
-        *[!A-Za-z0-9.-]*|"") diag "set-pref: invalid hostname"; return 1 ;;
-      esac
-      _flag="--hostname=${_v}" ;;
-    advertise-routes)
-      case "${_v}" in
-        "") _flag="--advertise-routes=" ;;
-        *[!0-9a-fA-F:.,/]*) diag "set-pref: invalid route list"; return 1 ;;
-        *) _flag="--advertise-routes=${_v}" ;;
-      esac ;;
-    exit-node)
-      # Refused on purpose: see the note in the WebUI. Without SO_MARK the
-      # daemon's own packets would be routed back into its own tunnel.
-      diag "set-pref: exit-node is not supported by this module"
-      return 3 ;;
-    *)
-      diag "set-pref: unknown key [${_k}]"
-      return 1 ;;
-  esac
-  diag "set-pref: ${_k} -> ${_flag}"
-  if "${tailscale_bin}" ${tailscale_bin_param} set "${_flag}" >>"${tailscaled_diag_log}" 2>&1; then
-    return 0
-  fi
-  return 1
-}
-
-_onoff() {
-  case "$1" in
-    on|true|1|yes|enable) echo "true" ;;
-    *) echo "false" ;;
-  esac
-}
-
-logout_now() {
-  stop_watchdog
-  "${tailscale_bin}" ${tailscale_bin_param} logout >/dev/null 2>&1
-  "${tailscale_bin}" ${tailscale_bin_param} down >/dev/null 2>&1
-  diag "logout: done"
-  return 0
+  echo "tun device:              ${tun_iface} $([ -d /sys/class/net/${tun_iface} ] && echo '(up)' || echo '(down)')"
 }
 
 # --------------------------------------------------------- WebUI helpers ---
@@ -547,6 +478,13 @@ show_webstatus() {
     echo "binary_ok=0"
   fi
 
+  if osrouter_active; then
+    echo "osrouter=1"
+    if main_route_matches "$(detect_default_route)"; then echo "main_default=ok"; else echo "main_default=NONE"; fi
+  else
+    echo "osrouter=0"
+    echo "main_default=n/a"
+  fi
   echo "exempt_prerouting=$(_exempt_state mangle PREROUTING)"
   echo "exempt_output=$(_exempt_state mangle OUTPUT)"
   echo "exempt_nat=$(_exempt_state nat OUTPUT)"
@@ -558,7 +496,10 @@ show_webstatus() {
     _json=$("${tailscale_bin}" ${tailscale_bin_param} status --json 2>/dev/null)
     _backend=$(printf '%s' "${_json}" | grep -o '"BackendState": *"[^"]*"' | head -n1 | sed 's/.*"\([^"]*\)"$/\1/')
     _user=$(printf '%s' "${_json}" | grep -o '"LoginName": *"[^"]*"' | head -n1 | sed 's/.*"\([^"]*\)"$/\1/')
-    _health=$("${tailscale_bin}" ${tailscale_bin_param} status 2>&1 | grep '^#' | sed 's/^#[[:space:]]*//' | head -n 3 | tr '\n' ';')
+    # Derive health from the JSON we already fetched: a second `tailscale status`
+    # call doubles the cost of every WebUI poll.
+    _health=$(printf '%s' "${_json}" | tr -d '\n' | grep -o '"Health":\[[^]]*\]' \
+                | sed 's/"Health":\[//; s/\]$//; s/"//g' | tr ',' ';')
   fi
   echo "backend=${_backend}"
   echo "user=${_user}"

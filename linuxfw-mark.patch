@@ -1,0 +1,36 @@
+diff --git a/tsconst/linuxfw.go b/tsconst/linuxfw.go
+index 3a7a4cf..be5230c 100644
+--- a/tsconst/linuxfw.go
++++ b/tsconst/linuxfw.go
+@@ -28,16 +28,25 @@
+ 	//
+ 	// We claim bits 16:23 entirely. For now we only use the lower four
+ 	// bits, leaving the higher 4 bits for future use.
+-	LinuxFwmarkMask    = "0xff0000"
+-	LinuxFwmarkMaskNum = 0xff0000
++	// NOTE: These marks are modified for Android. Android's netd uses the
++	// lower 0-20 bits of fwmark for its own purposes (netId:0-15,
++	// explicitlySelected:16, protectedFromVpn:17, permission:18-19,
++	// uidBillingDone:20). Stock marks (0x40000/0x80000) collide with the
++	// "permission" field, so tailscaled's bypass-tagged control-plane traffic
++	// gets misrouted and fails with "network is unreachable".
++	// We move Tailscale's marks into the upper reserved bits (21-28) that
++	// netd does not use, and claim protectedFromVpn (17) so tailscaled's
++	// traffic is not hijacked by a concurrent system VPN (Clash/Mihomo).
++	LinuxFwmarkMask    = "0x1e020000"
++	LinuxFwmarkMaskNum = 0x1e020000
+ 
+ 	// Packet is from Tailscale and to a subnet route destination, so
+ 	// is allowed to be routed through this machine.
+-	LinuxSubnetRouteMark    = "0x40000"
+-	LinuxSubnetRouteMarkNum = 0x40000
++	LinuxSubnetRouteMark    = "0x8000000"
++	LinuxSubnetRouteMarkNum = 0x8000000
+ 
+ 	// Packet was originated by tailscaled itself, and must not be
+ 	// routed over the Tailscale network.
+-	LinuxBypassMark    = "0x80000"
+-	LinuxBypassMarkNum = 0x80000
++	LinuxBypassMark    = "0x10020000"
++	LinuxBypassMarkNum = 0x10020000
+ )
