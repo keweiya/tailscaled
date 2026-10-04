@@ -116,18 +116,28 @@ routes_ok() {
 # "ping works but the browser hangs". The exemption must live in PREROUTING
 # itself, ahead of DIVERT: a rule inside BOX_EXTERNAL is useless because DIVERT
 # is evaluated first.
-ensure_proxy_exemption() {
-  iptables -t mangle -L PREROUTING -n -v >/dev/null 2>&1 || return 0
-  _div=$(iptables -t mangle -L PREROUTING -n -v --line-numbers 2>/dev/null | awk '/DIVERT/ {print $1; exit}')
-  [ -n "${_div}" ] || return 0
-  _in=$(iptables -t mangle -L PREROUTING -n -v --line-numbers 2>/dev/null | awk -v i="${tun_iface}" '$0 ~ i {print $1; exit}')
-  if [ -n "${_in}" ] && [ "${_in}" -lt "${_div}" ]; then
-    diag "proxy: inbound ${tun_iface} exemption at rule ${_in}, DIVERT at ${_div} -> order OK"
+exempt_tunnel() {
+  _exempt_one mangle PREROUTING -i
+  _exempt_one mangle OUTPUT     -o
+  _exempt_one nat    OUTPUT     -o
+  return 0
+}
+
+# Move "RETURN for tunnel traffic" to rule 1 of the given chain, if it is not
+# already the first rule. Cheap to call repeatedly, so the watchdog can re-assert
+# it every tick.
+_exempt_one() {
+  _tbl=$1
+  _chn=$2
+  _dir=$3
+  iptables -t "$_tbl" -L "$_chn" -n >/dev/null 2>&1 || return 0
+  if iptables -t "$_tbl" -L "$_chn" -n -v --line-numbers 2>/dev/null \
+       | awk -v i="${tun_iface}" '$1 == 1 && $0 ~ i { f = 1 } END { exit !f }'; then
     return 0
   fi
-  [ -n "${_in}" ] && iptables -t mangle -D PREROUTING -i "${tun_iface}" -j RETURN 2>/dev/null
-  if iptables -t mangle -I PREROUTING 1 -i "${tun_iface}" -j RETURN 2>/dev/null; then
-    diag "proxy: inserted '-i ${tun_iface} -j RETURN' at PREROUTING rule 1 (DIVERT was hijacking tailnet TCP)"
+  iptables -t "$_tbl" -D "$_chn" "$_dir" "${tun_iface}" -j RETURN 2>/dev/null
+  if iptables -t "$_tbl" -I "$_chn" 1 "$_dir" "${tun_iface}" -j RETURN 2>/dev/null; then
+    diag "proxy: ${_tbl}/${_chn} rule 1 -> RETURN ${_dir} ${tun_iface}"
   fi
   return 0
 }
@@ -149,7 +159,7 @@ add_routes() {
       diag "routes: WARN could not add rule for ${_pfx}"
     fi
   done
-  ensure_proxy_exemption
+  exempt_tunnel
   return 0
 }
 
@@ -172,7 +182,7 @@ route_watchdog() {
       diag "watchdog: routes missing or stale -> re-asserting"
       add_routes
     else
-      ensure_proxy_exemption
+      exempt_tunnel
     fi
   done
 }
@@ -260,6 +270,27 @@ show_routes() {
   ip rule show 2>/dev/null | grep "to .* lookup ${tun_table}" | sed 's/^/  /'
 }
 
+show_exemptions() {
+  for _spec in mangle:PREROUTING mangle:OUTPUT nat:OUTPUT; do
+    _t=${_spec%%:*}
+    _c=${_spec##*:}
+    if iptables -t "$_t" -L "$_c" -n >/dev/null 2>&1; then
+      _r=$(iptables -t "$_t" -L "$_c" -n -v --line-numbers 2>/dev/null | awk '$1 == 1 { print; exit }')
+      if echo "${_r}" | grep -q "${tun_iface}"; then
+        echo "  OK   ${_t}/${_c} rule 1: ${_r}"
+      else
+        echo "  BAD  ${_t}/${_c} rule 1: ${_r:-<empty>}   (tunnel traffic is NOT exempt)"
+      fi
+    else
+      echo "  --   ${_t}/${_c}: chain does not exist"
+    fi
+  done
+  if iptables -t mangle -L PREROUTING -n -v --line-numbers 2>/dev/null | grep -q DIVERT; then
+    echo "  note: a proxy DIVERT jump exists in mangle PREROUTING; the OK line above"
+    echo "        must come first or tailnet TCP (not ICMP) will be hijacked."
+  fi
+}
+
 show_diag() {
   echo "=== tailscaled diagnostic ==="
   echo "time:          $(date +'%Y-%m-%d %H:%M:%S')"
@@ -274,12 +305,8 @@ show_diag() {
   echo ""
   show_routes
   echo ""
-  echo "proxy DIVERT (Surfing/Clash TPROXY):"
-  if iptables -t mangle -L PREROUTING -n -v >/dev/null 2>&1; then
-    iptables -t mangle -L PREROUTING -n -v --line-numbers 2>/dev/null | head -n 6 | sed 's/^/  /'
-  else
-    echo "  (no mangle PREROUTING chain)"
-  fi
+  echo "tunnel exemptions (rule 1 of each chain must RETURN tunnel traffic):"
+  show_exemptions
   echo ""
   echo "daemon log (last 10 lines):"
   tail -n 10 "${tailscaled_log}" 2>/dev/null | sed 's/^/  /'

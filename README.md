@@ -65,6 +65,54 @@ does not exist in this setup.
 
 ---
 
+## Configuration: what lives where
+
+Two directories matter. The **module directory** is what the manager installs and
+replaces; the **state directory** holds everything that must survive an update.
+
+```
+/data/adb/modules/tailscaled/            module dir (replaced on update)
+├── module.prop                          id/name/version; description shows the run state
+├── system/bin/tailscale                 CLI wrapper (blocks `tailscale update`)
+├── system/bin/tailscaled                daemon wrapper
+├── system/bin/tailscaled.service        control-command wrapper
+└── META-INF/ customize.sh               installer only
+
+/data/adb/service.d/tailscaled_service.sh  boot entry (installed by customize.sh)
+
+/data/adb/tailscale/                     state dir (KEPT across module updates)
+├── settings.ini         <-- paths, TUN name, table id, rule priority
+├── routes               <-- WHICH PREFIXES GO INTO THE TUNNEL  (the usual knob)
+├── bin/
+│   ├── tailscale        combined binary (CLI)
+│   ├── tailscaled       combined binary (daemon)
+│   ├── tailscaled.orig  known-good copy for the binary guard
+│   └── tailscaled.sha256
+├── scripts/             start.sh, tailscaled.service, tailscaled.inotify
+└── run/                 state and logs
+    ├── tailscaled.state     identity + Tailscale preferences (login lives here)
+    ├── tailscaled.sock
+    ├── tailscaled.log       daemon log
+    ├── diag.log             what the routing logic did, step by step
+    ├── runs.log / service.log
+    └── tailscaled.pid / watchdog.pid
+```
+
+`settings.ini` and `routes` are only copied **on first install**, so your edits
+survive module updates. Deleting them restores the defaults.
+
+| What you want to change | Where |
+|---|---|
+| Which networks go through the tunnel | `/data/adb/tailscale/routes`, then `tailscaled.service restart` |
+| TUN name / table id / rule priority (advanced) | `/data/adb/tailscale/settings.ini` |
+| MagicDNS, hostname, SSH, exit node, `--accept-routes` | **not a file** — these are Tailscale preferences, set with the CLI and stored in `run/tailscaled.state`: `tailscale set --accept-dns=false`, `tailscale set --accept-routes`, `tailscale up --hostname=...` |
+| Anything about a proxy | not in this module — see the coexistence section |
+
+> `--accept-routes` and `routes` are complementary: `--accept-routes` makes
+> `tailscaled` *accept* the advertised routes in its netmap, and `routes` makes
+> the *kernel* send those destinations into the tunnel. Both are needed for a
+> subnet to work.
+
 ## Commands
 
 ```sh
@@ -116,37 +164,47 @@ proxy's rules are never disturbed.
 
 ---
 
-## Coexisting with Surfing / Clash / Mihomo
+## Coexisting with a proxy (Surfing / Clash / Mihomo / anything)
 
-This module does not fight the proxy, because it never marks or reroutes anything
-except the tailnet prefixes. One thing does need care:
+**You do not need to edit the proxy's configuration.** This module never marks or
+reroutes anything except the tailnet prefixes, so it does not compete with a proxy
+for traffic.
 
-Surfing's TPROXY insert a `DIVERT` jump at mangle `PREROUTING` rule 1:
+What a proxy *can* do is intercept the tunnel itself. On every start — and every
+15 s afterwards — the module puts a `RETURN` for tunnel traffic at rule 1 of three
+chains:
+
+```sh
+iptables -t mangle -I PREROUTING 1 -i tailscale0 -j RETURN   # replies coming back
+iptables -t mangle -I OUTPUT     1 -o tailscale0 -j RETURN   # packets leaving
+iptables -t nat    -I OUTPUT     1 -o tailscale0 -j RETURN   # REDIRECT-style proxies
+```
+
+These are harmless with no proxy installed (they simply return early for tunnel
+traffic) and they name **no proxy**, so **switching to a different proxy module
+needs no change here**. `tailscaled.service diag` shows whether each one is in
+place.
+
+### Why the inbound rule matters
+
+Surfing's TPROXY inserts a `DIVERT` jump at mangle `PREROUTING` rule 1:
 
 ```sh
 iptables -t mangle -I PREROUTING -p tcp -m socket -j DIVERT
 ```
 
-It matches **TCP only** with no interface condition, and `DIVERT` marks
-(`0x1000000`) and `ACCEPT`s the packet. The SYN-ACK of every TCP connection
-leaving through `tailscale0` therefore gets routed to the proxy's TPROXY port
-instead of the local socket: **the handshake never completes**. ICMP is never
-matched, so the symptom is the deceptive *"ping works, but the browser/curl
-hangs"*.
+It matches **TCP only** and has no interface condition. `DIVERT` marks
+(`0x1000000`) and `ACCEPT`s the packet, so the SYN-ACK of every TCP connection
+leaving through `tailscale0` is routed to the proxy's TPROXY port instead of the
+local socket and **the handshake never completes**. ICMP is never matched, which
+is why the symptom is the deceptive *"ping works, but the browser/curl hangs"*.
 
-The module keeps an exemption ahead of it:
+The exemption must be rule 1 **of `PREROUTING` itself**. Putting it inside
+`BOX_EXTERNAL` does nothing, because `DIVERT` is evaluated first.
 
-```sh
-iptables -t mangle -I PREROUTING 1 -i tailscale0 -j RETURN
-```
-
-The watchdog re-asserts it every 15 s, so it survives a proxy reload, an app
-toggle, or a Surfing update that rewrites its firewall.
-
-> The exemption must live in `PREROUTING` itself. Putting it inside
-> `BOX_EXTERNAL` does nothing, because `DIVERT` is evaluated first.
-
----
+If you would rather do it in the proxy's own config, Surfing's
+`ignore_out_list=("tailscale0")` handles the outbound direction — but it is not
+required, and it does not fix the inbound direction.
 
 ## Notes and limitations
 

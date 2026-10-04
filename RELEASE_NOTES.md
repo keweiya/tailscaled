@@ -13,9 +13,9 @@ The **official linux build** does the opposite: it tags its own sockets with `fw
 - **Binary guard**: a known-good copy plus sha256 is stored at install time; the service restores it whenever the binary was replaced, and the CLI refuses `tailscale update` outright.
 - **Destination-scoped routing**: `ip route <prefix> dev tailscale0 table 1099` plus `ip rule to <prefix> lookup 1099`, for every prefix in `/data/adb/tailscale/routes` (default `100.64.0.0/10`). No marks, no iptables, nothing else on the device touched.
 - **Advertised subnets**: add e.g. `192.168.100.0/24` to `routes` and a peer's LAN becomes reachable in any browser. (Upstream can only ever route `100.64.0.0/10`.)
-- **Proxy coexistence**: keeps `-i tailscale0 -j RETURN` at mangle `PREROUTING` rule 1, ahead of Surfing/Clash TPROXY's `DIVERT` jump. `DIVERT` matches TCP only and hijacks the SYN-ACK of every connection leaving through the tunnel, so the browser hangs while ping still works.
+- **Proxy coexistence, implementation-agnostic**: keeps `RETURN` for tunnel traffic at rule 1 of `mangle PREROUTING` (`-i`), `mangle OUTPUT` (`-o`) and `nat OUTPUT` (`-o`). It names no proxy, so **no proxy configuration has to change and swapping the proxy module needs no edits here**. This matters because Surfing/Clash TPROXY inserts a `DIVERT` jump at mangle PREROUTING rule 1 that matches TCP only and hijacks the SYN-ACK of every connection leaving through the tunnel: the browser hangs while ping keeps working.
 - **Watchdog**: re-asserts the routing and the exemption every 15 s (Android's netd rewrites the tables on every network transition).
-- **Diagnostics**: `tailscaled.service diag`.
+- **Diagnostics**: `tailscaled.service diag` (binary hash vs. expected, daemon and watchdog PIDs, routes, per-chain exemption verdict, logs) and `tailscaled.service routes`.
 
 ## Usage
 
