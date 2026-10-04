@@ -1,7 +1,7 @@
 id=tailscaled
-name=Tailscaled
-version=v1.82.5
-versionCode=1825
-author=repotitan
-description=Tailscale. The easiest, most secure way to use WireGuard and 2FA.
-updateJson=https://raw.githubusercontent.com/mgksu/tailscaled/refs/heads/main/update.json
+name=Tailscale (Android build)
+version=v1.102.4
+versionCode=1102004
+author=keweiya
+description=[ starting ] Tailscale for Android (self-contained GOOS=android build)
+updateJson=https://raw.githubusercontent.com/keweiya/tailscaled/refs/heads/main/update.json

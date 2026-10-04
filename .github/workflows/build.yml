@@ -1,162 +1,176 @@
 name: Build tailscale for Android
+
 on:
   workflow_dispatch:
     inputs:
-      force:
-        description: 'Force build'
+      version:
+        description: 'Tailscale version tag to build (default: latest stable)'
         required: false
-        type: boolean
-        default: false
+        default: ''
   schedule:
-    - cron: '0 0 * * 0'
-  
+    - cron: '0 3 * * *'
+
 permissions:
   contents: write
   actions: write
-  
+
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-    - name: Get latest stable release from tailscale
-      id: get_stable_release
-      uses: octokit/request-action@v2.x
-      with:
-        route: GET /repos/tailscale/tailscale/releases/latest
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-    
-    - name: Get latest tag
-      run: |
-        latestTag="${{ fromJSON(steps.get_stable_release.outputs.data).tag_name }}"
-        echo "Latest tag: $latestTag"
-        echo "TAILSCALE_VERSION=${latestTag}" >> $GITHUB_ENV
+      - uses: actions/checkout@v4
 
-    - name: Checkout code
-      uses: actions/checkout@v4
+      - name: Resolve Tailscale version
+        id: ver
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WANTED: ${{ inputs.version }}
+        run: |
+          v="$WANTED"
+          if [ -z "$v" ]; then
+            v=$(curl -fsSL https://api.github.com/repos/tailscale/tailscale/releases/latest | grep -m1 '"tag_name"' | cut -d'"' -f4)
+          fi
+          [ -n "$v" ] || { echo "could not resolve a version" >&2; exit 1; }
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "Resolved version: $v"
 
-    - name: Fetch tags
-      run: git fetch --prune --unshallow --tags
-
-    - name: Check Latest Version
-      if: ${{ inputs.force == false }}
-      run: |
-        LATEST_VERSION=$(git describe --tags --abbrev=0 --always)
-        if [ "$LATEST_VERSION" == "${{ env.TAILSCALE_VERSION }}" ]; then
-          gh run cancel ${{ github.run_id }}
-        else
-          echo "New version found: ${LATEST_VERSION}"
-        fi
-      env:
-       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-    - name: Checkout tailscale
-      uses: actions/checkout@v4
-      with:
-        repository: tailscale/tailscale
-        path: tailscale-build
-        ref: ${{ env.TAILSCALE_VERSION }}  
-
-    - name: Setup Go 1.24.x
-      uses: actions/setup-go@v5
-      with:
-        go-version: 'stable'
-        cache: false
-    
-    - name: Build Tailscale for Android
-      run: |
-
-        cd tailscale-build
-
-        patch -p1 < ../android.ssh.patch
-
-        sed -i 's|/etc/resolv.conf|/data/adb/tailscale/etc/resolv.conf|g' net/dns/resolvconfpath_default.go
-        sed -i 's|/etc/resolv.pre-tailscale-backup.conf|/data/adb/tailscale/etc/resolv.pre-tailscale-backup.conf|g' net/dns/resolvconfpath_default.go
-
-        eval `CGO_ENABLED=0 GOOS=$(go env GOHOSTOS) GOARCH=$(go env GOHOSTARCH) go run ./cmd/mkversion`
-        ldflags="-X tailscale.com/version.longStamp=${VERSION_LONG} -X tailscale.com/version.shortStamp=${VERSION_SHORT}"
-
-        echo "BUILD_TAILSCALE_VERSION=${VERSION_SHORT}" >> $GITHUB_ENV
-
-        NDK_BIN_PATH="$ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
-
-        echo "Building for arm64"
-        CC=${NDK_BIN_PATH}/aarch64-linux-android21-clang CXX=${NDK_BIN_PATH}/aarch64-linux-android21-clang++ CGO_ENABLED=1 GOOS=android GOARCH=arm64 go build -tags ts_include_cli -ldflags "$ldflags -s -w" -o ./tailscale.combined -trimpath ./cmd/tailscaled
-
-    - name: Install UPX
-      uses: crazy-max/ghaction-upx@v3
-      with:
-        install-only: true
-
-    - name: Compress binaries
-      run: |
-        upx --version
-
-        echo "Compressing tailscale binaries for arm64"
-        du -hs ./tailscale-build/tailscale.combined
-        upx --lzma --best ./tailscale-build/tailscale.combined
-        du -hs ./tailscale-build/tailscale.combined
-        mkdir -p files
-        cp ./tailscale-build/tailscale.combined files/tailscale.combined
-        rm -rf tailscale-build
-    
-    - name: Build Magisk Module
-      run: |
-          version="${{ env.TAILSCALE_VERSION }}"
-          version_code=$(echo "${version}" | sed 's/[^0-9]//g')
-          echo "version=${version}" >> $GITHUB_ENV
-          echo "versionCode=${version_code}" >> $GITHUB_ENV
-          echo version=${version}
-          echo versionCode=${version_code}
-          
-          echo "id=tailscaled" > module.prop
-          echo "name=Tailscaled" >> module.prop
-          echo "version=${version}" >> module.prop
-          echo "versionCode=${version_code}" >> module.prop
-          echo "author=repotitan" >> module.prop
-          echo "description=Tailscale. The easiest, most secure way to use WireGuard and 2FA." >> module.prop
-          echo "updateJson=https://raw.githubusercontent.com/${{ github.repository }}/refs/heads/main/update.json" >> module.prop
-    
-
-    - name: Create Module Zip
-      run: |
-        mkdir -p dist
-        zip -9 -r ./dist/Magisk-Tailscaled-${{ env.version }}.zip . -x "*git*" "dist/*" "*.zip" "*.json" "*.md" "*.patch"
-
-    - name: Set up Git
-      run: |
-          git config --global user.name "github-actions"
-          git config --global user.email "github-actions@github.com"
-
-    - name: Push updated files to Main branch
-      run: |
-          echo '{
-            "version": "${{ env.version }}",
-            "versionCode": "${{ env.versionCode }}",
-            "zipUrl": "https://github.com/${{ github.repository }}/releases/download/${{ env.version }}/Magisk-Tailscaled-${{ env.version }}.zip",
-            "changelog": "https://raw.githubusercontent.com/${{ github.repository }}/main/CHANGELOG.md"
-          }' > update.json
-          git add .
-          if git diff --staged --quiet; then
-            echo "No changes to commit"
+      - name: Skip if this release already exists
+        id: exists
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "${{ steps.ver.outputs.version }}" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
           else
-            git commit -m "Release ${{ env.version }}"
-            git push origin HEAD:main --force
-            git tag ${{ env.version }}
-            git push origin ${{ env.version }} -f
+            echo "exists=false" >> "$GITHUB_OUTPUT"
           fi
 
-    - name: Create Release
-      id: create_release
-      uses: softprops/action-gh-release@v2
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        append_body: true
-        generate_release_notes: true
-        make_latest: true
-        files: |
-          ./dist/Magisk-Tailscaled-${{ env.version }}.zip
-        name: ${{ env.version }}
-        tag_name: ${{ env.version }}
+      - name: Checkout Tailscale
+        if: steps.exists.outputs.exists == 'false'
+        uses: actions/checkout@v4
+        with:
+          repository: tailscale/tailscale
+          path: tailscale-build
+          ref: ${{ steps.ver.outputs.version }}
 
+      - name: Setup Go
+        if: steps.exists.outputs.exists == 'false'
+        uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+          cache: false
+
+      - name: Build (GOOS=android, pure Go)
+        if: steps.exists.outputs.exists == 'false'
+        env:
+          GOOS: android
+          GOARCH: arm64
+          CGO_ENABLED: '0'
+          # GOOS=android also satisfies the "linux" build tag, so packages that do
+          # not exclude android (cmd/tailscaled/ssh.go, the desktop systray/dbus/
+          # resolved/networkmanager integrations) would pull in Linux-only files
+          # that are themselves excluded -> undefined symbols at link time. Omit
+          # them: none apply to a headless Android daemon. ts_include_cli builds
+          # one binary that serves as both tailscaled and the tailscale CLI.
+          TAGS: ts_include_cli,ts_omit_ssh,ts_omit_systray,ts_omit_syslog,ts_omit_dbus,ts_omit_resolved,ts_omit_networkmanager
+        run: |
+          set -e
+          cd tailscale-build
+
+          # Android has no usable /etc/resolv.conf; point the Go resolver at a
+          # path the module creates.
+          sed -i 's|/etc/resolv.conf|/data/adb/tailscale/resolv.conf|g' net/dns/resolvconfpath_default.go
+          sed -i 's|/etc/resolv.pre-tailscale-backup.conf|/data/adb/tailscale/resolv.pre-tailscale-backup.conf|g' net/dns/resolvconfpath_default.go
+          grep -n 'resolvConf' net/dns/resolvconfpath_default.go
+
+          eval "$(CGO_ENABLED=0 GOOS=$(go env GOHOSTOS) GOARCH=$(go env GOHOSTARCH) go run ./cmd/mkversion)"
+          echo "building ${VERSION_SHORT} (${VERSION_LONG})"
+
+          mkdir -p ../files
+          go build -trimpath -tags "$TAGS" \
+            -ldflags "-X tailscale.com/version.longStamp=${VERSION_LONG} -X tailscale.com/version.shortStamp=${VERSION_SHORT} -s -w" \
+            -o ../files/tailscale.combined ./cmd/tailscaled
+
+          # Sanity check: this must be an android target, i.e. osrouter (and its
+          # fwmark / "lookup main" / ts-* iptables code) must NOT be present.
+          if grep -aq 'ts-postrouting' ../files/tailscale.combined; then
+            echo "ERROR: binary contains osrouter iptables code - wrong GOOS?" >&2
+            exit 1
+          fi
+          echo "verified: no osrouter code in the binary"
+
+          ls -l ../files/tailscale.combined
+          od -A x -t x1z -N 20 ../files/tailscale.combined | head -2
+
+      - name: Build module zip
+        if: steps.exists.outputs.exists == 'false'
+        env:
+          V: ${{ steps.ver.outputs.version }}
+        run: |
+          set -e
+          # major*1000000 + minor*1000 + patch, so 1.102.4 -> 1102004
+          VC=$(echo "$V" | sed 's/^v//' | awk -F. '{printf "%d", $1*1000000 + $2*1000 + $3}')
+          sed -i -e "s/^version=.*/version=$V/" -e "s/^versionCode=.*/versionCode=$VC/" module.prop
+          awk -F'=' '/^description=/ { print "  ", $2 }' module.prop
+
+          mkdir -p dist
+          FILES="META-INF customize.sh service.sh system tailscale uninstall.sh module.prop"
+          zip -9 -r "dist/tailscaled-$V.zip" $FILES files -x '*.DS_Store'
+          ls -l dist/
+
+      - name: Publish release
+        if: steps.exists.outputs.exists == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          V: ${{ steps.ver.outputs.version }}
+        run: |
+          set -e
+          gh release create "$V" "dist/tailscaled-$V.zip" \
+            --title "Tailscale $V (Android)" \
+            --notes "Self-contained KernelSU/Magisk module running a **GOOS=android** tailscaled.
+
+## Why GOOS=android matters
+With \`GOOS=android\` Tailscale compiles out \`wgengine/router/osrouter\`, so tailscaled installs **no ip rules, no routes and no iptables chains**, and does not use \`SO_MARK\`. The official Android app supplies routing through Java VpnService; this module supplies the minimum itself (only the tailnet prefixes, only by destination).
+
+The official linux build does the opposite: it tags its own sockets with fwmark \`0x80000\` and routes them via \`lookup main\`, which is empty on Android -> \`network is unreachable\` and the link is blocked. **That is why \`tailscale update\` used to break this module.**
+
+## What this build adds over the upstream module
+- **Binary guard**: a known-good copy plus checksum; the service restores it whenever something replaced the binary (and the CLI refuses \`tailscale update\`).
+- **Destination-scoped routing**: \`ip rule to <prefix> lookup 1099\` for every prefix in \`/data/adb/tailscale/routes\` (default \`100.64.0.0/10\`). No marks, no interference with a proxy.
+- **Advertised subnets**: add e.g. \`192.168.100.0/24\` to \`routes\` to reach a peer's LAN.
+- **Proxy coexistence**: keeps an \`-i tailscale0 -j RETURN\` exemption ahead of Surfing/Clash TPROXY's \`DIVERT\` jump, which otherwise hijacks the SYN-ACK of every TCP connection and makes the browser hang while ping still works.
+- **Watchdog**: re-asserts the routing every 15s (Android's netd rewrites tables on network transitions).
+- **Diagnostics**: \`tailscaled.service diag\`.
+
+## Usage
+\`\`\`
+su -c 'tailscaled.service start'
+su -c 'tailscale login'
+su -c 'tailscaled.service diag'
+\`\`\`
+
+## Notes
+- arm64 only. Tailscale SSH is not included (built with \`ts_omit_ssh\`).
+- UPX is not used: the front-end's own compression can fail on ROMs that forbid executable anonymous mappings." 2>&1 | tail -3
+
+      - name: Update update.json
+        if: steps.exists.outputs.exists == 'false'
+        env:
+          V: ${{ steps.ver.outputs.version }}
+        run: |
+          set -e
+          # major*1000000 + minor*1000 + patch, so 1.102.4 -> 1102004
+          VC=$(echo "$V" | sed 's/^v//' | awk -F. '{printf "%d", $1*1000000 + $2*1000 + $3}')
+          cat > update.json <<EOF
+          {
+            "version": "$V",
+            "versionCode": $VC,
+            "zipUrl": "https://github.com/${GITHUB_REPOSITORY}/releases/download/$V/tailscaled-$V.zip",
+            "changelog": "https://github.com/${GITHUB_REPOSITORY}/releases/tag/$V"
+          }
+          EOF
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add update.json module.prop
+          git commit -m "Release $V" || true
+          git push || true

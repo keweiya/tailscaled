@@ -1,7 +1,13 @@
 #!/system/bin/sh
-source /data/adb/tailscale/settings.ini
-if [ $# -eq 0 ]; then # if no arguments are passed, start tailscaled
-    "${tailscaled_bin}" ${tailscaled_bin_param}
-else # otherwise, run tailscale with the arguments passed
-    "${tailscaled_bin}" "$@"
+# `tailscaled` wrapper.
+#
+# With no arguments it delegates to the service (which applies the binary guard
+# and installs the routing). With arguments it runs the binary directly, so
+# flags such as --version / --help still work.
+. /data/adb/tailscale/settings.ini
+
+if [ $# -eq 0 ]; then
+  exec "${tailscaled_service}" start
 fi
+
+exec "${tailscaled_bin}" "$@"

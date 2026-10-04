@@ -1,0 +1,19 @@
+# Destinations routed into the Tailscale TUN device (tailscale0).
+#
+# A GOOS=android tailscaled installs no routes itself (it has no osrouter), so
+# this module installs them: every prefix listed here is sent through a private
+# routing table and selected by destination only. Nothing else on the device is
+# affected, so a proxy such as Surfing/Clash keeps working unchanged.
+#
+# One prefix per line. '#' starts a comment. After editing run:
+#     su -c 'tailscaled.service restart'
+#
+# Tailscale's own address range (100.x.y.z). Do not remove.
+100.64.0.0/10
+
+# Advertised subnet routes go here. A peer that runs
+#     tailscale up --advertise-routes=192.168.100.0/24
+# (with the route approved in the admin console) becomes reachable at its LAN
+# addresses once you list that prefix below, e.g.:
+#
+# 192.168.100.0/24

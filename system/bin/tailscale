@@ -1,7 +1,24 @@
 #!/system/bin/sh
-source /data/adb/tailscale/settings.ini
-if echo "$@" | grep -q -- '--socket='; then # if socket is specified, use it
-    "${tailscale_bin}" "$@"
-else # otherwise, use the default socket
-    "${tailscale_bin}" ${tailscale_bin_param} "$@" 
+# `tailscale` CLI wrapper. Adds the default socket and blocks the self-updater.
+. /data/adb/tailscale/settings.ini
+
+case "$1" in
+  update)
+    echo "tailscale update is disabled in this module." >&2
+    echo "" >&2
+    echo "It would download the official GOOS=linux build, which activates" >&2
+    echo "Tailscale's osrouter (fwmark + 'lookup main' + ts-* iptables chains)." >&2
+    echo "Android has no usable 'main' route, so the control plane fails with" >&2
+    echo "'network is unreachable' and the link is blocked." >&2
+    echo "" >&2
+    echo "Update the module instead, or rebuild it from source." >&2
+    exit 1
+    ;;
+esac
+
+if echo "$@" | grep -q -- '--socket='; then
+  # An explicit socket was passed: use the arguments as-is.
+  exec "${tailscale_bin}" "$@"
 fi
+
+exec "${tailscale_bin}" ${tailscale_bin_param} "$@"
