@@ -145,6 +145,67 @@ textarea:focus { outline: none; border-color: var(--accent); }
   -webkit-user-select: text; user-select: text;
 }
 
+/* ----------------------------------------------------------------- switch */
+.switch-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  padding: 12px 0;
+  border-bottom: 1px solid var(--line);
+  cursor: pointer;
+}
+.switch-row:last-child { border-bottom: 0; padding-bottom: 0; }
+.switch-row > span { min-width: 0; }
+.switch-row b { display: block; font-weight: 600; font-size: 14px; }
+.switch-row em {
+  display: block; font-style: normal; color: var(--muted);
+  font-size: 12px; margin-top: 3px;
+}
+.switch-row.on b { color: var(--accent); }
+
+.switch-row input[type="checkbox"] {
+  appearance: none; -webkit-appearance: none;
+  flex: 0 0 auto;
+  width: 46px; height: 27px; border-radius: 999px;
+  background: var(--card-2); border: 1px solid var(--line);
+  position: relative; cursor: pointer; transition: background .18s, border-color .18s;
+}
+.switch-row input[type="checkbox"]::after {
+  content: ''; position: absolute; top: 2px; left: 2px;
+  width: 21px; height: 21px; border-radius: 50%;
+  background: var(--muted); transition: transform .18s, background .18s;
+}
+.switch-row input[type="checkbox"]:checked {
+  background: rgba(76,141,255,.22); border-color: var(--accent);
+}
+.switch-row input[type="checkbox"]:checked::after {
+  transform: translateX(19px); background: var(--accent);
+}
+.switch-row input[type="checkbox"]:disabled { opacity: .5; }
+
+/* -------------------------------------------------------------- inputs ---- */
+.row { display: flex; gap: 8px; align-items: stretch; }
+.row input[type="text"] {
+  flex: 1 1 auto; min-width: 0;
+  background: #0b0d11; color: var(--fg);
+  border: 1px solid var(--line); border-radius: 10px;
+  padding: 11px; font: inherit;
+  -webkit-user-select: text; user-select: text;
+}
+.row input[type="text"]:focus { outline: none; border-color: var(--accent); }
+.row button { flex: 0 0 auto; }
+
+.notes { margin: 0; padding-left: 18px; color: var(--muted); font-size: 12.5px; }
+.notes li { margin-bottom: 10px; }
+.notes li:last-child { margin-bottom: 0; }
+.notes b { color: var(--fg); }
+
+button.danger { border-color: rgba(229,84,75,.5); color: #ffb3ae; }
+button.danger.armed { background: var(--bad); border-color: var(--bad); color: #fff; }
+
+.code.small { max-height: 30vh; font-size: 12px; }
+
 /* ------------------------------------------------------------------- toast */
 .toast {
   position: fixed; left: 50%; bottom: 22px; transform: translate(-50%, 24px);

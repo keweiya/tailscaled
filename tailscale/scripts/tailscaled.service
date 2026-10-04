@@ -16,6 +16,28 @@ DIR=${0%/*}
 . "${DIR}/../settings.ini"
 scripts_name=$(basename "$0")
 
+# settings.ini is only written on first install, so an upgrade keeps the previous
+# copy. Fill in anything it may not define yet instead of failing.
+: "${tailscale_dir:=/data/adb/tailscale}"
+: "${tailscale_bin:=${tailscale_dir}/bin/tailscale}"
+: "${tailscaled_bin:=${tailscale_dir}/bin/tailscaled}"
+: "${tailscaled_bin_pristine:=${tailscaled_bin}.orig}"
+: "${tailscaled_bin_sum:=${tailscaled_bin}.sha256}"
+: "${tailscaled_run_dir:=${tailscale_dir}/run}"
+: "${tailscale_routes_file:=${tailscale_dir}/routes}"
+: "${tailscale_routes_auto_file:=${tailscale_dir}/routes.auto}"
+: "${tailscaled_log:=${tailscaled_run_dir}/tailscaled.log}"
+: "${tailscaled_pid:=${tailscaled_run_dir}/tailscaled.pid}"
+: "${tailscaled_runs_log:=${tailscaled_run_dir}/runs.log}"
+: "${tailscaled_service_log:=${tailscaled_run_dir}/service.log}"
+: "${tailscaled_diag_log:=${tailscaled_run_dir}/diag.log}"
+: "${module_prop:=/data/adb/modules/tailscaled/module.prop}"
+: "${sync_routes_auto:=1}"
+: "${sync_every_ticks:=4}"
+: "${tun_iface:=tailscale0}"
+: "${tun_table:=1099}"
+: "${tun_rule_pref:=12000}"
+
 # ---------------------------------------------------------------- helpers ---
 daemon_pid() {
   if [ -f "${tailscaled_pid}" ]; then
@@ -73,11 +95,21 @@ ensure_binary() {
 }
 
 # --------------------------------------------------------------- routing ---
-# Prefixes routed into the TUN device. One per line; '#' starts a comment.
+# Prefixes routed into the TUN device. The union of two files:
+#   routes       hand-written by you, never rewritten by the module
+#   routes.auto  discovered from the tailnet (see routes_sync)
+# '#' starts a comment in either.
 route_prefixes() {
-  if [ -f "${tailscale_routes_file}" ]; then
-    sed -e 's/#.*//' -e 's/[[:space:]]//g' "${tailscale_routes_file}" 2>/dev/null \
-      | grep -E '^[0-9a-fA-F:.]+/[0-9]+$'
+  _pf=""
+  for _f in "${tailscale_routes_file}" "${tailscale_routes_auto_file}"; do
+    if [ -f "${_f}" ]; then
+      _pf="${_pf}
+$(sed -e 's/#.*//' -e 's/[[:space:]]//g' "${_f}" 2>/dev/null | grep -E '^[0-9a-fA-F:.]+/[0-9]+$')"
+    fi
+  done
+  _pf=$(printf '%s\n' "${_pf}" | grep -E '^[0-9a-fA-F:.]+/[0-9]+$' | sort -u)
+  if [ -n "${_pf}" ]; then
+    printf '%s\n' "${_pf}"
   else
     echo "100.64.0.0/10"
   fi
@@ -175,14 +207,25 @@ del_routes() {
 # Android's netd rewrites the routing tables on every network transition, and a
 # proxy may reload its firewall at any time, so re-assert periodically.
 route_watchdog() {
+  _tick=0
   while :; do
     sleep 15
+    _tick=$((_tick + 1))
     [ -n "$(daemon_pid)" ] || { diag "watchdog: daemon gone, exiting"; exit 0; }
     if ! routes_ok; then
       diag "watchdog: routes missing or stale -> re-asserting"
       add_routes
     else
       exempt_tunnel
+    fi
+    # Periodically pick up subnet routes that appeared or disappeared in the
+    # tailnet. One status query per interval, so this stays cheap.
+    if [ "${sync_routes_auto}" = "1" ]; then
+      _every=${sync_every_ticks:-4}
+      case "${_every}" in ''|*[!0-9]*|0) _every=4 ;; esac
+      if [ "$((_tick % _every))" -eq 0 ]; then
+        routes_sync
+      fi
     fi
   done
 }
@@ -210,6 +253,7 @@ start_tailscaled() {
     diag "start: already running (PID ${_pid})"
     add_routes
     start_watchdog
+    [ "${sync_routes_auto}" = "1" ] && routes_sync
     return 0
   fi
   ensure_binary || return 1
@@ -232,6 +276,9 @@ start_tailscaled() {
   start_watchdog
   # Best effort: discourage Tailscale's own updater from replacing our binary.
   "${tailscale_bin}" ${tailscale_bin_param} set --auto-update=false >/dev/null 2>&1
+  # Pick up the subnet routes the tailnet offers right away (exit 2 = the user
+  # still has --accept-routes off; nothing to do until they enable it).
+  [ "${sync_routes_auto}" = "1" ] && routes_sync
   return 0
 }
 
@@ -262,8 +309,10 @@ show_status() {
 }
 
 show_routes() {
-  echo "prefixes:      $(route_prefixes | tr '\n' ' ')"
-  echo "tun device:    ${tun_iface} $([ -d /sys/class/net/${tun_iface} ] && echo '(up)' || echo '(down)')"
+  echo "manual (routes):        $(grep -E '^[0-9a-fA-F:.]+/[0-9]+$' "${tailscale_routes_file}" 2>/dev/null | tr '\n' ' ')"
+  echo "discovered (routes.auto): $(grep -E '^[0-9a-fA-F:.]+/[0-9]+$' "${tailscale_routes_auto_file}" 2>/dev/null | tr '\n' ' ')"
+  echo "in use:                 $(route_prefixes | tr '\n' ' ')"
+  echo "tun device:             ${tun_iface} $([ -d /sys/class/net/${tun_iface} ] && echo '(up)' || echo '(down)')"
   echo "table ${tun_table}:"
   ip route show table "${tun_table}" 2>/dev/null | sed 's/^/  /'
   echo "ip rules:"
@@ -328,6 +377,138 @@ log_view() {
   esac
 }
 
+# ------------------------------------------------------- subnet discovery ---
+# The control plane tells every node which subnet routes it can reach
+# (ipnstate.PeerStatus.PrimaryRoutes). Read them from `tailscale status --json`,
+# write them to routes.auto and install routing for them. Hand-written entries in
+# `routes` are kept and merged, never clobbered.
+#
+# PrimaryRoutes is only populated for routes we actually accepted, so
+# --accept-routes must be on first; otherwise there is nothing to discover.
+# Exit code 2 means exactly that, so the WebUI can offer to enable it.
+routes_sync() {
+  if [ -z "$(daemon_pid)" ] || [ ! -S "${tailscale_dir}/run/tailscaled.sock" ]; then
+    diag "routes-sync: daemon/socket not available"
+    return 1
+  fi
+
+  if ! "${tailscale_bin}" ${tailscale_bin_param} debug prefs 2>/dev/null | grep -q '"RouteAll": *true'; then
+    diag "routes-sync: --accept-routes is OFF, so the netmap carries no subnet routes"
+    return 2
+  fi
+
+  _json=$("${tailscale_bin}" ${tailscale_bin_param} status --json 2>/dev/null)
+  _found=$(printf '%s' "${_json}" | tr -d ' \n\t' \
+             | grep -o '"PrimaryRoutes":\[[^]]*\]' \
+             | grep -o '[0-9a-fA-F:.]\+/[0-9]\+' | sort -u)
+  _old=$(grep -E '^[0-9a-fA-F:.]+/[0-9]+$' "${tailscale_routes_auto_file}" 2>/dev/null | sort -u)
+
+  if [ "${_found}" = "${_old}" ]; then
+    diag "routes-sync: unchanged ($(printf '%s' "${_found}" | tr '\n' ' '))"
+    return 0
+  fi
+
+  {
+    echo "# Written by 'tailscaled.service routes-sync'. Regenerated automatically,"
+    echo "# so local edits here are lost - put your own entries in 'routes' instead."
+    echo "# Updated: $(date +'%Y-%m-%d %H:%M:%S')"
+    if [ -n "${_found}" ]; then
+      printf '%s\n' "${_found}"
+    else
+      echo "# no subnet routes visible yet - is --accept-routes on and the route"
+      echo "# approved in the admin console?"
+    fi
+  } > "${tailscale_routes_auto_file}" 2>/dev/null
+
+  diag "routes-sync: discovered [$(printf '%s' "${_found}" | tr '\n' ' ')]"
+  routes_reload
+  return 0
+}
+
+# ------------------------------------------------------------ preferences ---
+_jbool() {
+  _v=$(printf '%s' "$1" | grep -o "\"$2\": *[a-z]*" | head -n1 | sed 's/.*: *//')
+  case "${_v}" in true) echo 1 ;; *) echo 0 ;; esac
+}
+
+_jstr() {
+  printf '%s' "$1" | grep -o "\"$2\": *\"[^\"]*\"" | head -n1 | sed 's/.*"\([^"]*\)"$/\1/'
+}
+
+# Machine-readable Tailscale preferences for the WebUI.
+show_prefs() {
+  _p=$("${tailscale_bin}" ${tailscale_bin_param} debug prefs 2>/dev/null)
+  if [ -z "${_p}" ]; then
+    echo "prefs_ok=0"
+    return 1
+  fi
+  echo "prefs_ok=1"
+  echo "accept_routes=$(_jbool "${_p}" RouteAll)"
+  echo "accept_dns=$(_jbool "${_p}" CorpDNS)"
+  echo "shields_up=$(_jbool "${_p}" ShieldsUp)"
+  echo "want_running=$(_jbool "${_p}" WantRunning)"
+  echo "logged_out=$(_jbool "${_p}" LoggedOut)"
+  echo "hostname=$(_jstr "${_p}" Hostname)"
+  echo "exit_node=$(_jstr "${_p}" ExitNodeID)"
+  echo "advertise_routes=$(printf '%s' "${_p}" | tr -d ' \n' \
+        | grep -o '"AdvertiseRoutes":\[[^]]*\]' | grep -o '[0-9a-fA-F:.]\+/[0-9]\+' | tr '\n' ',')"
+  echo "discovered=$(grep -E '^[0-9a-fA-F:.]+/[0-9]+$' "${tailscale_routes_auto_file}" 2>/dev/null | tr '\n' ',')"
+}
+
+# Whitelisted preference changes. The value is always passed as a single
+# argument, and only known keys are accepted, so the WebUI cannot inject flags.
+set_pref() {
+  _k=$1
+  _v=$2
+  case "$_k" in
+    accept-routes)      _flag="--accept-routes=$(_onoff "${_v}")" ;;
+    accept-dns)         _flag="--accept-dns=$(_onoff "${_v}")" ;;
+    shields-up)         _flag="--shields-up=$(_onoff "${_v}")" ;;
+    exit-node-allow-lan) _flag="--exit-node-allow-lan-access=$(_onoff "${_v}")" ;;
+    advertise-exit-node) _flag="--advertise-exit-node=$(_onoff "${_v}")" ;;
+    auto-update)        _flag="--auto-update=$(_onoff "${_v}")" ;;
+    hostname)
+      case "${_v}" in
+        *[!A-Za-z0-9.-]*|"") diag "set-pref: invalid hostname"; return 1 ;;
+      esac
+      _flag="--hostname=${_v}" ;;
+    advertise-routes)
+      case "${_v}" in
+        "") _flag="--advertise-routes=" ;;
+        *[!0-9a-fA-F:.,/]*) diag "set-pref: invalid route list"; return 1 ;;
+        *) _flag="--advertise-routes=${_v}" ;;
+      esac ;;
+    exit-node)
+      # Refused on purpose: see the note in the WebUI. Without SO_MARK the
+      # daemon's own packets would be routed back into its own tunnel.
+      diag "set-pref: exit-node is not supported by this module"
+      return 3 ;;
+    *)
+      diag "set-pref: unknown key [${_k}]"
+      return 1 ;;
+  esac
+  diag "set-pref: ${_k} -> ${_flag}"
+  if "${tailscale_bin}" ${tailscale_bin_param} set "${_flag}" >>"${tailscaled_diag_log}" 2>&1; then
+    return 0
+  fi
+  return 1
+}
+
+_onoff() {
+  case "$1" in
+    on|true|1|yes|enable) echo "true" ;;
+    *) echo "false" ;;
+  esac
+}
+
+logout_now() {
+  stop_watchdog
+  "${tailscale_bin}" ${tailscale_bin_param} logout >/dev/null 2>&1
+  "${tailscale_bin}" ${tailscale_bin_param} down >/dev/null 2>&1
+  diag "logout: done"
+  return 0
+}
+
 # --------------------------------------------------------- WebUI helpers ---
 # Verdict for one chain: is rule 1 a RETURN for tunnel traffic?
 _exempt_state() {
@@ -355,6 +536,7 @@ show_webstatus() {
   [ -n "${_ip}" ] || _ip=$("${tailscale_bin}" ${tailscale_bin_param} ip -4 2>/dev/null | head -n1)
   echo "ip4=${_ip}"
   echo "routes=$(route_prefixes | tr '\n' ' ')"
+  echo "routes_auto=$(grep -cE '^[0-9a-fA-F:.]+/[0-9]+$' "${tailscale_routes_auto_file}" 2>/dev/null)"
   echo "version=$(awk -F'=' '/^version=/ { print $2 }' "${module_prop}" 2>/dev/null)"
 
   _want=$(cat "${tailscaled_bin_sum}" 2>/dev/null)
@@ -410,9 +592,13 @@ case "$1" in
   diag)       show_diag ;;
   webstatus)  show_webstatus ;;
   routes-reload) routes_reload ;;
+  routes-sync)   routes_sync ;;
+  prefs)      show_prefs ;;
+  set-pref)   set_pref "$2" "$3" ;;
+  logout)     logout_now ;;
   log)        log_view "$2" ;;
   __watchdog) route_watchdog ;;
   *)
-    echo "usage: ${scripts_name} {start|stop|restart|status|routes|routes-reload|diag|webstatus|log{runs|service|tailscaled|diag}}"
+    echo "usage: ${scripts_name} {start|stop|restart|status|routes|routes-reload|routes-sync|diag|webstatus|prefs|set-pref <key> <value>|logout|log{runs|service|tailscaled|diag}}"
     ;;
 esac

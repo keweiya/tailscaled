@@ -7,7 +7,7 @@ const DIAG_LOG = `${STATE_DIR}/run/diag.log`;
 const SVC = 'tailscaled.service';
 
 const $ = (id) => document.getElementById(id);
-const state = { status: {}, busy: false, autoLog: false, logTimer: null };
+const state = { status: {}, prefs: {}, busy: false, autoLog: false, logTimer: null };
 
 /* ------------------------------------------------------------------ toast -- */
 function toast(message, kind = 'info') {
@@ -193,15 +193,147 @@ function toggleAutoLog() {
   if (state.autoLog) state.logTimer = setInterval(loadLog, 3000);
 }
 
+/* ---------------------------------------------------------------- features --- */
+const SWITCHES = {
+  'sw-accept-routes': 'accept-routes',
+  'sw-accept-dns': 'accept-dns',
+  'sw-shields-up': 'shields-up',
+  'sw-advertise-exit-node': 'advertise-exit-node',
+};
+
+function setSwitch(id, on) {
+  const el = $(id);
+  el.checked = on;
+  el.closest('.switch-row').classList.toggle('on', on);
+}
+
+function discoveredList() {
+  return ((state.prefs || {}).discovered || '').split(',').filter(Boolean);
+}
+
+function renderDiscovered() {
+  const list = discoveredList();
+  $('discovered').textContent = list.length ? list.join('\n') : '(none discovered yet)';
+}
+
+async function loadPrefs() {
+  const res = await run(`${SVC} prefs`, { quiet: true });
+  if (!res.stdout) { $('discovered').textContent = 'tailscaled is not running'; return; }
+  const p = parseKv(res.stdout);
+  state.prefs = p;
+  setSwitch('sw-accept-routes', p.accept_routes === '1');
+  setSwitch('sw-accept-dns', p.accept_dns === '1');
+  setSwitch('sw-shields-up', p.shields_up === '1');
+  setSwitch('sw-advertise-exit-node', (p.advertise_routes || '').indexOf('0.0.0.0/0') >= 0);
+  if (document.activeElement !== $('in-hostname')) $('in-hostname').value = p.hostname || '';
+  renderDiscovered();
+}
+
+async function togglePref(id) {
+  const key = SWITCHES[id];
+  const el = $(id);
+  const want = el.checked;
+  el.disabled = true;
+  const res = await run(`${SVC} set-pref ${key} ${want ? 'on' : 'off'}`, { quiet: true });
+  if (res.errno === 0) {
+    toast(`${key} ${want ? 'enabled' : 'disabled'}`);
+    await loadPrefs();
+    await refreshStatus();
+  } else {
+    const msg = (res.stderr || res.stdout || '').trim().split('\n').pop();
+    toast((msg || `${key} failed`).slice(0, 150), 'error');
+    setSwitch(id, !want);
+  }
+  el.disabled = false;
+}
+
+async function setHostname() {
+  const v = $('in-hostname').value.trim();
+  if (!/^[A-Za-z0-9.-]+$/.test(v)) { toast('letters, digits, dots and dashes only', 'error'); return; }
+  const res = await run(`${SVC} set-pref hostname ${v}`, { quiet: true });
+  toast(res.errno === 0 ? `hostname set to ${v}` : 'could not set the hostname', res.errno === 0 ? 'info' : 'error');
+  await loadPrefs();
+}
+
+async function setAdvertiseRoutes() {
+  const v = $('in-advertise').value.trim();
+  if (v && !/^[0-9a-fA-F:.,/]+$/.test(v)) { toast('invalid CIDR list', 'error'); return; }
+  const res = await run(`${SVC} set-pref advertise-routes ${v}`, { quiet: true });
+  toast(res.errno === 0 ? 'advertised routes updated' : 'could not update', res.errno === 0 ? 'info' : 'error');
+  await loadPrefs();
+}
+
+/* Discover the subnet routes the tailnet offers and install them.
+   Exit code 2 means --accept-routes is off, so there was nothing to see: turn it
+   on and retry automatically rather than making the user guess. */
+async function discover() {
+  setBusy(true);
+  try {
+    let res = await run(`${SVC} routes-sync`, { quiet: true });
+    if (res.errno === 2) {
+      toast('accept-routes was off - enabling it and retrying…');
+      await run(`${SVC} set-pref accept-routes on`, { quiet: true });
+      await new Promise((r) => setTimeout(r, 2000));
+      res = await run(`${SVC} routes-sync`, { quiet: true });
+    }
+    await loadPrefs();
+    await loadRoutes();
+    await refreshStatus();
+    if (res.errno === 0) {
+      const n = discoveredList().length;
+      toast(n ? `discovered ${n} subnet route(s)` : 'no subnet routes visible yet (approved in the admin console?)');
+    } else {
+      toast((res.stderr || 'discovery failed').trim().split('\n').pop().slice(0, 150), 'error');
+    }
+  } finally {
+    setBusy(false);
+  }
+}
+
+/* Two-tap arming instead of confirm(): some manager WebViews do not implement
+   window.confirm and would silently return false. */
+function armButton(el, label, handler) {
+  let armed = false;
+  let timer = null;
+  el.onclick = async () => {
+    if (!armed) {
+      armed = true;
+      el.dataset.label = el.textContent;
+      el.textContent = label;
+      el.classList.add('armed');
+      timer = setTimeout(() => { armed = false; el.textContent = el.dataset.label; el.classList.remove('armed'); }, 4000);
+      return;
+    }
+    clearTimeout(timer);
+    armed = false;
+    el.textContent = el.dataset.label;
+    el.classList.remove('armed');
+    await handler();
+  };
+}
+
+async function logout() {
+  setBusy(true);
+  try {
+    await run(`${SVC} logout`);
+    await refreshStatus();
+    await loadPrefs();
+    toast('logged out - tap Login to authorise again');
+  } finally {
+    setBusy(false);
+  }
+}
+
 /* -------------------------------------------------------------------- tabs --- */
 function showTab(name) {
-  ['status', 'routes', 'log', 'diag'].forEach((t) => {
+  ['status', 'routes', 'features', 'log', 'diag'].forEach((t) => {
     $(`tab-${t}`).classList.toggle('active', t === name);
     $(`panel-${t}`).style.display = t === name ? '' : 'none';
   });
   if (name === 'log') loadLog();
   if (name === 'diag') loadDiag();
-  if (name === 'routes') loadRoutes();
+  if (name === 'routes') { loadRoutes(); renderDiscovered(); }
+  if (name === 'features') loadPrefs();
 }
 
 /* -------------------------------------------------------------------- init --- */
@@ -211,14 +343,25 @@ function wire() {
     b.onclick = () => action(b.dataset.action);
   });
   $('btn-login').onclick = login;
+  armButton($('btn-logout'), 'tap again to log out', logout);
+
   $('btn-save').onclick = saveRoutes;
   $('btn-reset').onclick = resetRoutes;
+  $('btn-discover').onclick = discover;
+
+  $('btn-prefs-refresh').onclick = async () => { await loadPrefs(); toast('features refreshed'); };
+  Object.keys(SWITCHES).forEach((id) => { $(id).onchange = () => togglePref(id); });
+  $('btn-hostname').onclick = setHostname;
+  $('btn-advertise').onclick = setAdvertiseRoutes;
+
   $('btn-log-refresh').onclick = loadLog;
   $('btn-diag-refresh').onclick = loadDiag;
   $('btn-clear').onclick = clearLogs;
   $('auto').onclick = toggleAutoLog;
+
   $('tab-status').onclick = () => showTab('status');
   $('tab-routes').onclick = () => showTab('routes');
+  $('tab-features').onclick = () => showTab('features');
   $('tab-log').onclick = () => showTab('log');
   $('tab-diag').onclick = () => showTab('diag');
 }
@@ -226,4 +369,12 @@ function wire() {
 wire();
 showTab('status');
 refreshStatus({ silent: true });
-setInterval(() => { if (!state.busy && document.visibilityState === 'visible') refreshStatus(); }, 5000);
+loadPrefs();
+
+let tick = 0;
+setInterval(() => {
+  if (state.busy || document.visibilityState !== 'visible') return;
+  refreshStatus();
+  tick += 1;
+  if (tick % 4 === 0 && $('panel-features').style.display !== 'none') loadPrefs();
+}, 5000);

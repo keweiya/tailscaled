@@ -82,7 +82,8 @@ replaces; the **state directory** holds everything that must survive an update.
 
 /data/adb/tailscale/                     state dir (KEPT across module updates)
 ├── settings.ini         <-- paths, TUN name, table id, rule priority
-├── routes               <-- WHICH PREFIXES GO INTO THE TUNNEL  (the usual knob)
+├── routes               <-- WHICH PREFIXES GO INTO THE TUNNEL  (yours to edit)
+├── routes.auto          subnet routes discovered from the tailnet (regenerated)
 ├── bin/
 │   ├── tailscale        combined binary (CLI)
 │   ├── tailscaled       combined binary (daemon)
@@ -121,7 +122,8 @@ manager). Four tabs:
 | Tab | What it does |
 |---|---|
 | **Status** | live state dot, tailnet address, `BackendState`, routed prefixes, whether the binary still matches the known-good copy, and the three proxy-exemption verdicts. Start / Stop / Restart, plus **Login**, which fetches a `login.tailscale.com` link and shows it as a tappable URL. |
-| **Routes** | edit `/data/adb/tailscale/routes` in place and press *Save & apply* — the service drops the old rules and installs the new ones immediately, no restart needed. |
+| **Routes** | edit `/data/adb/tailscale/routes` in place and press *Save & apply* — the service drops the old rules and installs the new ones immediately, no restart needed. Below it, **Discover** fetches the subnet routes the tailnet offers, writes `routes.auto` and installs them (if *Accept subnet routes* is off it turns it on and retries). |
+| **Features** | switches for **Accept subnet routes**, **Accept DNS**, **Shields up** and **Advertise as an exit node**; a field for the device **hostname** and one for **advertised routes**; plus what this build cannot do (exit node, SSH, self-update) and **Log out**. |
 | **Log** | the daemon log, with an auto-refresh toggle and a clear button. |
 | **Diagnostics** | the same dump as `tailscaled.service diag`. |
 
@@ -132,15 +134,27 @@ reads *unavailable*, the manager's root bridge is not answering — use the CLI.
 ## Commands
 
 ```sh
+# service
 tailscaled.service start|stop|restart|status
-tailscaled.service routes        # show the routing that is installed
-tailscaled.service diag          # full diagnostic dump
+tailscaled.service routes            # routing that is installed (manual + discovered)
+tailscaled.service routes-reload     # re-read the route files and apply
+tailscaled.service routes-sync       # discover tailnet subnets and apply them
+tailscaled.service diag              # full diagnostic dump
+tailscaled.service webstatus         # machine-readable state (what the WebUI uses)
+tailscaled.service prefs             # machine-readable Tailscale preferences
 tailscaled.service log {runs|service|tailscaled|diag}
 
+# preferences (whitelisted: accept-routes, accept-dns, shields-up,
+# advertise-exit-node, advertise-routes, hostname, auto-update)
+tailscaled.service set-pref accept-routes on
+tailscaled.service set-pref accept-dns off
+tailscaled.service set-pref advertise-routes 192.168.1.0/24
+tailscaled.service logout
+
+# the CLI, as usual
 tailscale status
 tailscale ip
 tailscale ping <peer>
-tailscale set --accept-dns=false
 ```
 
 `tailscaled.service diag` prints the binary hash vs. the expected one, the daemon
@@ -152,33 +166,55 @@ jump is present, and the tail of the logs. **Start there when something is off.*
 ## Reaching advertised subnets
 
 A `GOOS=android` daemon has no `osrouter`, so `--accept-routes` cannot install
-kernel routes. List the prefixes you want instead — one per line in
-`/data/adb/tailscale/routes`:
+kernel routes: the module installs them instead. Two files feed the routing and
+`route_prefixes()` merges them:
+
+| File | Managed by | Purpose |
+|---|---|---|
+| `/data/adb/tailscale/routes` | **you** | hand-written prefixes. Never rewritten by the module. |
+| `/data/adb/tailscale/routes.auto` | the module | subnet routes discovered from the tailnet. Regenerated on every sync. |
+
+### Automatic (recommended)
+
+Open the WebUI → **Routes** → *Discover*, or run:
+
+```sh
+su -c 'tailscale set --accept-routes'      # once, so the netmap carries the routes
+su -c 'tailscaled.service routes-sync'
+```
+
+The module reads the subnet routes the control plane says are reachable
+(`Peer.PrimaryRoutes` in `tailscale status --json`), writes them to
+`routes.auto`, and installs `ip route … table 1099` plus
+`ip rule to <prefix> lookup 1099` for each one. It also re-syncs on every service
+start and every 60 s from the watchdog, so routes that appear (or disappear)
+later are picked up without you touching anything.
+
+### Manual
+
+Add prefixes to `/data/adb/tailscale/routes`, one per line:
 
 ```
 100.64.0.0/10
 192.168.100.0/24
 ```
 
-```sh
-su -c 'tailscaled.service restart'
-```
+then `su -c 'tailscaled.service restart'`.
 
-The prefix must be advertised by a peer (`tailscale up
---advertise-routes=192.168.100.0/24`) and approved in the admin console. Then
-`http://192.168.100.1` works in any browser.
+Either way the route must be advertised by a peer
+(`tailscale up --advertise-routes=192.168.100.0/24`) **and approved in the admin
+console**, and `--accept-routes` must be on — that flag makes `tailscaled`
+*accept* the routes into its netmap; the route files make the *kernel* send those
+destinations into the tunnel. Both are required.
 
-Under the hood this is only:
+Under the hood the whole mechanism is just:
 
 ```sh
 ip route replace <prefix> dev tailscale0 table 1099
-ip rule  add to <prefix> lookup 1099 pref 12000
+ip rule  add to <prefix> lookup 1099 pref 12000     # selection is BY DESTINATION
 ```
 
-Selection is **by destination**: nothing else on the device is touched, so a
-proxy's rules are never disturbed.
-
----
+Nothing else on the device is touched, so a proxy's rules are never disturbed.
 
 ## Coexisting with a proxy (Surfing / Clash / Mihomo / anything)
 

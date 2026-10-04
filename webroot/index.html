@@ -22,6 +22,7 @@
 <nav class="tabs">
   <button id="tab-status" class="tab">Status</button>
   <button id="tab-routes" class="tab">Routes</button>
+  <button id="tab-features" class="tab">Features</button>
   <button id="tab-log"    class="tab">Log</button>
   <button id="tab-diag"   class="tab">Diagnostics</button>
 </nav>
@@ -39,6 +40,7 @@
         <button data-action="stop">Stop</button>
         <button data-action="restart">Restart</button>
         <button id="btn-login" class="ghost">Login</button>
+        <button id="btn-logout" class="danger">Log out</button>
       </div>
       <div id="login-box" class="login-box" style="display:none">
         <div class="hint">Open this link to authorise this device:</div>
@@ -85,6 +87,102 @@
         Remember that <code>tailscale set --accept-routes</code> must also be on,
         otherwise tailscaled drops the packets it receives for those subnets.
       </p>
+    </div>
+
+    <div class="card">
+      <div class="card-title">
+        Discovered subnets
+        <span class="right"><button id="btn-discover" class="chip">discover</button></span>
+      </div>
+      <p class="hint">
+        Reads the subnet routes the control plane says are reachable
+        (<code>Peer.PrimaryRoutes</code>), writes them to
+        <code>routes.auto</code> and installs them. This file is regenerated
+        automatically, so your own entries in <code>routes</code> are never touched.
+        Requires <b>Accept subnet routes</b> to be on.
+      </p>
+      <div id="discovered" class="code small">(not discovered yet)</div>
+    </div>
+  </section>
+
+  <!-- --------------------------------------------------------- features -->
+  <section id="panel-features" style="display:none">
+    <div class="card">
+      <div class="card-title">
+        Tailscale features
+        <span class="right"><button id="btn-prefs-refresh" class="chip">refresh</button></span>
+      </div>
+
+      <label class="switch-row">
+        <span>
+          <b>Accept subnet routes</b>
+          <em>Required before any subnet route can reach this device. Turn this on, then use <i>Discover</i> on the Routes tab.</em>
+        </span>
+        <input type="checkbox" id="sw-accept-routes">
+      </label>
+
+      <label class="switch-row">
+        <span>
+          <b>Accept DNS (MagicDNS)</b>
+          <em>Keep this off: MagicDNS needs a local DNS listener that does not exist in this setup.</em>
+        </span>
+        <input type="checkbox" id="sw-accept-dns">
+      </label>
+
+      <label class="switch-row">
+        <span>
+          <b>Shields up</b>
+          <em>Refuse all incoming connections.</em>
+        </span>
+        <input type="checkbox" id="sw-shields-up">
+      </label>
+
+      <label class="switch-row">
+        <span>
+          <b>Advertise as an exit node</b>
+          <em>Lets <i>other</i> devices route their internet traffic through this phone.</em>
+        </span>
+        <input type="checkbox" id="sw-advertise-exit-node">
+      </label>
+    </div>
+
+    <div class="card">
+      <div class="card-title">Device name</div>
+      <div class="row">
+        <input id="in-hostname" type="text" spellcheck="false" placeholder="hostname">
+        <button id="btn-hostname" class="primary">Set</button>
+      </div>
+      <p class="hint">Letters, digits, dots and dashes only.</p>
+    </div>
+
+    <div class="card">
+      <div class="card-title">Advertised routes (this device as a subnet router)</div>
+      <div class="row">
+        <input id="in-advertise" type="text" spellcheck="false" placeholder="192.168.1.0/24,10.0.0.0/8">
+        <button id="btn-advertise" class="primary">Set</button>
+      </div>
+      <p class="hint">Comma-separated CIDRs. Routes must be approved in the admin console.</p>
+    </div>
+
+    <div class="card">
+      <div class="card-title">Not available in this build</div>
+      <ul class="notes">
+        <li>
+          <b>Use an exit node</b> — impossible here. A <code>GOOS=android</code>
+          tailscaled cannot mark its own sockets, so routing <code>0.0.0.0/0</code>
+          into the tunnel would send the daemon's own packets back into its own
+          tunnel and stall it. The module refuses this on purpose.
+        </li>
+        <li>
+          <b>Tailscale SSH</b> — built with <code>ts_omit_ssh</code>:
+          <code>feature/ssh</code> excludes android while
+          <code>cmd/tailscaled/ssh.go</code> does not, so it cannot be linked.
+        </li>
+        <li>
+          <b>Automatic updates</b> — forced off. An upstream update installs the
+          linux build, which blocks the link; the binary guard reverts it.
+        </li>
+      </ul>
     </div>
   </section>
 
