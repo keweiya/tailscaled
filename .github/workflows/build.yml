@@ -7,6 +7,13 @@ on:
         description: 'Tailscale version tag to build (default: latest stable)'
         required: false
         default: ''
+  # Dispatch is unreliable on forks, so a build can also be forced by pushing a
+  # change to the 'trigger-build' file:
+  #     date > trigger-build && git commit -am build && git push
+  push:
+    branches: [ main ]
+    paths:
+      - 'trigger-build'
   schedule:
     - cron: '0 3 * * *'
 
